@@ -1,0 +1,23 @@
+# Freezes mantau-agent into a single standalone Linux binary for whatever
+# platform this image is built for (--platform linux/amd64 or linux/arm64
+# via buildx+QEMU) -- not a runtime image, just a build environment. Build
+# context is mantau-prototype/ (this repo's sibling), same as the real
+# Dockerfile, since it needs the mantau-core sibling package too.
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg libgl1 libglib2.0-0 binutils \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY mantau-core /src/mantau-core
+COPY mantau-agent /src/mantau-agent
+
+RUN pip install --no-cache-dir -e /src/mantau-core \
+ && pip install --no-cache-dir -e /src/mantau-agent \
+ && pip install --no-cache-dir pyinstaller
+
+WORKDIR /src/mantau-agent
+ENTRYPOINT ["python", "-m", "PyInstaller", "--onefile", \
+            "--workpath", "/tmp/build", "--specpath", "/tmp/build", \
+            "--distpath", "/out", "packaging/entrypoint.py"]

@@ -20,9 +20,37 @@ the eventual dedicated device (target hardware: Orange Pi Zero 2W class,
                                                                      outage)
 ```
 
+## Installing on a real device (no Python, no git)
+
+This is the actual install path for a device that isn't a dev machine —
+the household's spare PC, a Raspberry Pi, or an old Android phone. Download
+the binary for your platform from this repo's
+[**Releases**](https://github.com/Kita-Ngulang-Foundation/mantau-agent/releases)
+page and run it:
+
+| Device | Download | Run |
+|---|---|---|
+| Windows PC | `mantau-agent-windows-x64.exe` | Double-click it, or run from a terminal |
+| Raspberry Pi / generic Linux box | `mantau-agent-linux-x64` (regular PC/laptop) or `mantau-agent-linux-arm64` (Raspberry Pi) | `chmod +x mantau-agent-linux-*` then `./mantau-agent-linux-*` |
+| An old/unused Android phone | `mantau-agent-linux-arm64` | Install [Termux](https://f-droid.org/packages/com.termux/) from F-Droid, then inside it: `chmod +x mantau-agent-linux-arm64 && ./mantau-agent-linux-arm64` |
+
+First run walks you through setup interactively — no manual `curl` command,
+no environment variables to set by hand: it registers itself with the
+server, looks for cameras on the network (or lets you type one in), and
+saves everything so it never asks again. See `setup_wizard.py` for exactly
+what it does. See `packaging/README.md` if you're building these binaries
+yourself rather than downloading them.
+
+**Why not a real Android app?** See `packaging/README.md`'s last section —
+short version: this is a headless background service, which is exactly
+what Android's battery/background-execution restrictions actively fight
+without a dedicated foreground-service app. Termux is the pragmatic bridge
+that actually works today; a native APK would be a genuinely separate,
+much larger project.
+
 ## Install (local dev)
 
-Requires Python 3.10â€“3.12, and `mantau-core` checked out two levels up
+Requires Python 3.10–3.12, and `mantau-core` checked out two levels up
 (`../../mantau-core`) -- it isn't published anywhere yet.
 
 ```powershell
@@ -32,7 +60,11 @@ py -3.12 -m venv .venv
 
 ## Run
 
-Enroll against a running server first (see `../server/README.md`), then:
+Either let the first-run wizard handle enrollment and camera setup
+interactively (`.venv\Scripts\python.exe -m mantau_agent.main` with no
+`MANTAU_*` env vars set), or set everything by hand for a non-interactive
+run (e.g. Docker Compose, or scripting a fleet of test agents) — enroll
+against a running server first (see `../server/README.md`), then:
 
 ```powershell
 $env:MANTAU_SERVER_URL = "http://localhost:8100"
@@ -59,7 +91,7 @@ through a brief outage" window, reused directly rather than redeclared):
 | `MANTAU_AGENT_ID`, `MANTAU_AGENT_SECRET` | *(required)* | From the server's `POST /agents/enroll`. |
 | `MANTAU_CAMERA_HOST`, `MANTAU_CAMERA_PORT`, `MANTAU_CAMERA_MAIN_PATH`, `MANTAU_CAMERA_SUB_PATH`, `MANTAU_CAMERA_USERNAME`, `MANTAU_CAMERA_PASSWORD` | -- | Manual camera config. ONVIF discovery (`discovery/onvif.py`) is built but not wired into `main.py` yet -- see "Known gaps". |
 | `MANTAU_DETECTOR_BACKEND` | `null` | `null` (works today) or `mediapipe` (needs `mantau-core[detection]` **and** mantau-ai to ship a streaming entrypoint). |
-| `MANTAU_NULL_DETECTOR_TRIGGER_EVERY` | `150` | With the null backend, fire a synthetic FallEvent every N frames -- proves capture â†’ relay â†’ server â†’ alert without real detection. |
+| `MANTAU_NULL_DETECTOR_TRIGGER_EVERY` | `150` | With the null backend, fire a synthetic FallEvent every N frames -- proves capture → relay → server → alert without real detection. |
 | `MANTAU_SAMPLER_KEEP_EVERY_N`, `MANTAU_SAMPLER_MAX_FPS` | `1`, unset | Frame decimation -- see `detect/sampler.py`. The target hardware cannot run detection at full camera framerate. |
 | `MANTAU_TUNNEL_PROVIDER` | `null` | `null` (direct reachability -- fine when agent and server share a network, e.g. in Docker Compose) or `tailscale` (shells out to the real CLI). |
 | `MANTAU_SEQ_PATH`, `MANTAU_SPOOL_PATH` | `data/seq.txt`, `data/spool.db` | The crash-safe seq counter and the outage spool -- see `uplink/`. |

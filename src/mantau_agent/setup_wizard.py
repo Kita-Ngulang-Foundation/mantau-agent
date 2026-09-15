@@ -119,36 +119,49 @@ def _pick_camera_interactive() -> dict:
     }
 
 
+_NON_INTERACTIVE_MESSAGE = (
+    "This device isn't enrolled yet, and setup needs an interactive "
+    "terminal (it wasn't given one -- e.g. running under Docker without "
+    "-it, or as a background service).\n"
+    "Either run this once interactively first, or set "
+    "MANTAU_AGENT_ID / MANTAU_AGENT_SECRET / MANTAU_CAMERA_HOST "
+    "(and friends) directly as environment variables."
+)
+
+
 def run_wizard(env_path: Path = ENV_PATH) -> None:
     if not sys.stdin.isatty():
-        print(
-            "This device isn't enrolled yet, and setup needs an interactive "
-            "terminal (it wasn't given one -- e.g. running under Docker "
-            "without -it, or as a background service).\n"
-            "Either run this once interactively first, or set "
-            "MANTAU_AGENT_ID / MANTAU_AGENT_SECRET / MANTAU_CAMERA_HOST "
-            "(and friends) directly as environment variables.",
-            file=sys.stderr,
-        )
+        print(_NON_INTERACTIVE_MESSAGE, file=sys.stderr)
         sys.exit(1)
 
     print("=== Mantau agent -- first-time setup ===\n")
     print("This only runs once. Everything below is saved so future restarts")
     print("start monitoring immediately.\n")
 
-    server_url = _prompt("Mantau server URL", default="http://localhost:8100")
-    agent_id = _prompt("A name for this device", default=default_agent_id())
-
-    print(f"\nRegistering '{agent_id}' with {server_url} ...")
     try:
-        secret = enroll(server_url, agent_id)
-    except httpx.HTTPError as exc:
-        print(f"\nCould not reach the server: {exc}")
-        print("Check the server URL and your network connection, then run this again.")
-        sys.exit(1)
-    print("Registered.")
+        server_url = _prompt("Mantau server URL", default="http://localhost:8100")
+        agent_id = _prompt("A name for this device", default=default_agent_id())
 
-    camera = _pick_camera_interactive()
+        print(f"\nRegistering '{agent_id}' with {server_url} ...")
+        try:
+            secret = enroll(server_url, agent_id)
+        except httpx.HTTPError as exc:
+            print(f"\nCould not reach the server: {exc}")
+            print("Check the server URL and your network connection, then run this again.")
+            sys.exit(1)
+        print("Registered.")
+
+        camera = _pick_camera_interactive()
+    except EOFError:
+        # isatty() can still say True on a technically-console-attached but
+        # actually-empty stdin (observed running a frozen exe under a
+        # redirected/emulated shell) -- this is the real backstop, not just
+        # defensive padding: it's what actually fired in that case.
+        print(f"\n{_NON_INTERACTIVE_MESSAGE}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nSetup cancelled.", file=sys.stderr)
+        sys.exit(1)
 
     env_path.write_text(
         render_env_file(server_url=server_url, agent_id=agent_id, secret=secret, camera=camera),
