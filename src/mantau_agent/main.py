@@ -116,6 +116,10 @@ async def run(settings: Settings | None = None) -> None:
 
 
 def main() -> None:
+    from .setup_wizard import needs_setup, run_wizard
+
+    if needs_setup():
+        run_wizard()
     asyncio.run(run())
 
 
