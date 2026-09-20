@@ -31,10 +31,19 @@ class Settings(CoreSettings):
 
     # -- detection -------------------------------------------------------------
     detector_backend: str = "null"       # "null" | "mediapipe"
-    null_detector_trigger_every: int | None = 150
+    # None = never fire a synthetic fall. Notifications are supposed to mean a
+    # real fall happened, so the default detector stays silent until a real
+    # model is wired in; set a frame count only when demoing the alert path.
+    null_detector_trigger_every: int | None = None
     sampler_keep_every_n: int = 1
     sampler_max_fps: float | None = None
     poll_interval_s: float = 0.02
+
+    # -- live view ---------------------------------------------------------------
+    live_view_enabled: bool = True
+    live_view_fps: float = 4.0
+    live_view_jpeg_quality: int = 70
+    live_view_max_width: int = 640
 
     # -- uplink -----------------------------------------------------------------
     tunnel_provider: str = "null"  # "null" | "tailscale"

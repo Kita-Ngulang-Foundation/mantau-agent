@@ -22,6 +22,7 @@ from .detect.runner import DetectRunner
 from .detect.sampler import FrameSampler
 from .health.heartbeat import HeartbeatLoop
 from .uplink.client import UplinkClient
+from .uplink.frames import FrameUplink
 from .uplink.seq import SeqCounter
 from .uplink.spool import EnvelopeSpool
 from .uplink.tunnel import NullTunnel, TailscaleTunnel, TunnelProvider
@@ -103,15 +104,31 @@ async def run(settings: Settings | None = None) -> None:
                                    backoff=BackoffPolicy(base=1.0, cap=15.0))
     heartbeat_supervisor = Supervisor("heartbeat", lambda: heartbeat.run(stop_event=stop_event),
                                       backoff=BackoffPolicy(base=1.0, cap=15.0))
+    tasks = [
+        detect_supervisor.run_forever(stop_event=stop_event),
+        heartbeat_supervisor.run_forever(stop_event=stop_event),
+    ]
+
+    frame_uplink: FrameUplink | None = None
+    if settings.live_view_enabled:
+        frame_uplink = FrameUplink(
+            settings.server_url, settings.agent_id, settings.agent_secret, settings.camera_id,
+            fps=settings.live_view_fps, jpeg_quality=settings.live_view_jpeg_quality,
+            max_width=settings.live_view_max_width,
+        )
+        frames_supervisor = Supervisor(
+            "frame-uplink", lambda: frame_uplink.run(puller, stop_event=stop_event),
+            backoff=BackoffPolicy(base=1.0, cap=15.0),
+        )
+        tasks.append(frames_supervisor.run_forever(stop_event=stop_event))
 
     try:
-        await asyncio.gather(
-            detect_supervisor.run_forever(stop_event=stop_event),
-            heartbeat_supervisor.run_forever(stop_event=stop_event),
-        )
+        await asyncio.gather(*tasks)
     finally:
         puller.stop()
         await uplink.close()
+        if frame_uplink is not None:
+            await frame_uplink.close()
         await tunnel.down()
 
 
