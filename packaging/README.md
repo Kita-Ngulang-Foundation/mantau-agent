@@ -3,8 +3,9 @@
 Turns "clone the repo, create a venv, pip install, run a module" into
 "download one file and run it" — no Python, git, or pip required on the
 target device. This is what actually makes the agent installable on a
-Raspberry Pi, a spare Linux/Windows box, or (via Termux) an old Android
-phone, by someone who isn't setting up a dev environment.
+Raspberry Pi or a spare Linux/Windows box, without setting up a development
+environment. Android is a platform identifier only; no Android runtime is built
+or validated here.
 
 `entrypoint.py` is the single script PyInstaller freezes; it just calls
 `mantau_agent.main.main()`, which runs the first-run setup wizard
@@ -38,9 +39,7 @@ cd mantau-agent
 docker build --platform linux/amd64 -f packaging\Dockerfile.pyinstaller -t mantau-agent-pyi:amd64 ..
 docker run --rm -v "${PWD}\dist\linux-x64:/out" mantau-agent-pyi:amd64 --name mantau-agent-linux-x64
 
-# arm64 (Raspberry Pi -- and the same binary works inside Termux on a
-# 64-bit Android phone, see the top-level README's "Installing on an old
-# phone" section)
+# arm64 (Raspberry Pi and generic Linux ARM64; Android is not validated)
 docker build --platform linux/arm64 -f packaging\Dockerfile.pyinstaller -t mantau-agent-pyi:arm64 ..
 docker run --rm -v "${PWD}\dist\linux-arm64:/out" --platform linux/arm64 mantau-agent-pyi:arm64 --name mantau-agent-linux-arm64
 ```
@@ -65,8 +64,7 @@ anything else means the freeze is missing something.
 
 ## What's NOT built here
 
-An Android APK. See the top-level README's device-support notes for why —
-short version: this is a headless background service, which is exactly
-what Android actively fights without a foreground-service app wrapper.
-The pragmatic bridge to an old Android phone is running the `arm64` Linux
-binary above inside Termux, not a native app.
+Android packaging and execution are deferred. The agent can identify Android
+in a capability report, but this repository does not provide an APK,
+foreground service, or a validated Termux installation. The Linux ARM64 build
+must not be treated as a tested Android binary.

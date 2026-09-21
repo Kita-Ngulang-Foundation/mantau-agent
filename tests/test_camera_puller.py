@@ -89,3 +89,36 @@ def test_stop_interrupts_a_long_backoff_wait_promptly():
 def test_latest_frame_is_none_before_start():
     puller = CameraPuller(CAMERA, capture_factory=lambda: _FakeCapture([FRAME]))
     assert puller.latest_frame() is None
+
+
+def test_normal_shutdown_releases_capture():
+    released = []
+
+    class Capture(_FakeCapture):
+        def release(self):
+            released.append(True)
+
+    puller = CameraPuller(CAMERA, capture_factory=lambda: Capture([FRAME]))
+    puller.start()
+    assert _wait_until(lambda: puller.latest_frame() is not None)
+    puller.stop()
+    assert released == [True]
+    assert not puller.reachable
+
+
+def test_failed_native_open_releases_capture(monkeypatch):
+    released = []
+
+    class ClosedCapture:
+        def isOpened(self):
+            return False
+
+        def release(self):
+            released.append(True)
+
+    monkeypatch.setattr("mantau_agent.camera.puller.cv2.VideoCapture", lambda *args: ClosedCapture())
+    puller = CameraPuller(CAMERA, backoff=BackoffPolicy(base=5, cap=5))
+    puller.start()
+    assert _wait_until(lambda: puller.restarts >= 1)
+    puller.stop()
+    assert released == [True]

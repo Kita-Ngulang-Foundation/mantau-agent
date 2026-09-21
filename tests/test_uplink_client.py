@@ -6,6 +6,8 @@ what piled up.
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 from mantau_core.buffer import DurableSpool
 from mantau_core.contracts import Envelope, FallEvent, Heartbeat
@@ -121,3 +123,44 @@ async def test_send_heartbeat_signs_and_sends_too(tmp_path):
 
     assert len(calls) == 1
     await client.close()
+
+
+async def test_cancelled_send_is_spooled_before_cancellation_propagates(tmp_path):
+    started = asyncio.Event()
+
+    async def handler(request):
+        started.set()
+        await asyncio.Event().wait()
+
+    client, spool = _client_and_spool(handler, tmp_path)
+    task = asyncio.create_task(client.send_event(FallEvent(camera_id="cam-1")))
+    await started.wait()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert spool.depth() == 1
+    assert spool.pending()[0].verify("shared-secret")
+    await client.close()
+    spool.close()
+
+
+async def test_expired_events_are_not_replayed(tmp_path):
+    durable = DurableSpool(tmp_path / "spool.db", ttl_s=1)
+    envelope = Envelope.for_event("agent", 0, FallEvent(camera_id="cam")).sign("secret")
+    durable.put("agent:0", envelope.model_dump_json(), at=0)
+    spool = EnvelopeSpool(durable)
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = UplinkClient("http://server", "agent", "secret",
+                              SeqCounter(tmp_path / "seq"), spool, client=http)
+        assert await client.drain_spool() == 0
+    assert calls == []
+    assert spool.depth() == 0
+    spool.close()

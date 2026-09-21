@@ -48,8 +48,13 @@ class CameraPuller:
 
     def _open_cv2(self):
         url = self.camera.stream_url(self.profile)
-        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+        # Bound native open/read calls so stop() can join the capture thread.
+        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG, [
+            cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 1500,
+            cv2.CAP_PROP_READ_TIMEOUT_MSEC, 1500,
+        ])
         if not cap.isOpened():
+            cap.release()
             raise ConnectionError(f"could not open RTSP stream for camera {self.camera.camera_id!r}")
         return cap
 
@@ -82,12 +87,18 @@ class CameraPuller:
                 if cap is not None:
                     with contextlib.suppress(Exception):
                         cap.release()
+                    cap = None
                 if self._stop.is_set():
                     break
                 self.restarts += 1
                 delay = self._backoff.delay_for(attempt)
                 attempt += 1
                 self._stop.wait(delay)
+            finally:
+                if cap is not None:
+                    with contextlib.suppress(Exception):
+                        cap.release()
+        self.reachable = False
 
     def latest_frame(self) -> tuple[np.ndarray, int] | None:
         with self._lock:
@@ -97,4 +108,6 @@ class CameraPuller:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+            if self._thread.is_alive():
+                raise TimeoutError("Camera capture did not stop within 2 seconds")
             self._thread = None

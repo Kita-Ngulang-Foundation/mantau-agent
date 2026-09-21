@@ -28,7 +28,7 @@ ENV_PATH = Path(".env")
 
 def needs_setup(settings: Settings | None = None) -> bool:
     s = settings or Settings()
-    return not (s.agent_id and s.agent_secret and s.camera_host)
+    return not (s.agent_id and s.agent_secret and (s.camera_host or s.use_onvif_discovery))
 
 
 def default_agent_id() -> str:

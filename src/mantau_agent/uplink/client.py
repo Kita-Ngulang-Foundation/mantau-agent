@@ -7,6 +7,8 @@ must never crash the detection loop that found it.
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 from mantau_core.contracts import Envelope, FallEvent, Heartbeat
 
@@ -42,8 +44,12 @@ class UplinkClient:
         await self._send_or_spool(envelope)
 
     async def _send_or_spool(self, envelope: Envelope) -> None:
+        self._spool.evict_expired()
         try:
             await self._post(envelope)
+        except asyncio.CancelledError:
+            self._spool.put(envelope)
+            raise
         except httpx.HTTPError:
             self._spool.put(envelope)
             return
@@ -61,6 +67,7 @@ class UplinkClient:
         """Attempt to send everything spooled, oldest first. Stops at the
         first failure (the tunnel is presumably still down) instead of
         burning through every item's retry on every call."""
+        self._spool.evict_expired()
         sent = 0
         for envelope in self._spool.pending(limit=max_items):
             try:

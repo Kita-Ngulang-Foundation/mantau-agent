@@ -40,6 +40,11 @@ def test_default_agent_id_is_prefixed_and_lowercase():
     assert agent_id == agent_id.lower()
 
 
+def test_configured_discovery_does_not_require_manual_host_for_setup():
+    assert not needs_setup(Settings(agent_id="agent", agent_secret="secret",
+                                    use_onvif_discovery=True))
+
+
 def test_render_env_file_includes_the_required_keys():
     text = render_env_file(
         server_url="https://server.example",

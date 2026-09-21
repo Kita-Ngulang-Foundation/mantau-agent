@@ -36,3 +36,6 @@ class EnvelopeSpool:
 
     def depth(self) -> int:
         return self._spool.depth()
+
+    def close(self) -> None:
+        self._spool.close()
