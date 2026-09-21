@@ -11,16 +11,18 @@ from typing import Any
 def atomic_write_bytes(path: str | Path, data: bytes, *, mode: int = 0o600) -> None:
     """Durably replace ``path`` without exposing a partial or permissive file."""
     target = Path(path)
+    parent_existed = target.parent.exists()
     target.parent.mkdir(parents=True, exist_ok=True)
-    if os.name != "nt":
+    if os.name != "nt" and not parent_existed:
         os.chmod(target.parent, 0o700)
     temporary = target.with_name(f".{target.name}.tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    descriptor = os.open(temporary, flags, mode)
+    descriptor: int | None = os.open(temporary, flags, mode)
     try:
         if os.name != "nt":
             os.fchmod(descriptor, mode)
-        with os.fdopen(descriptor, "wb", closefd=False) as handle:
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = None  # fdopen owns and closes it before Windows replace
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
@@ -33,7 +35,8 @@ def atomic_write_bytes(path: str | Path, data: bytes, *, mode: int = 0o600) -> N
             finally:
                 os.close(directory)
     finally:
-        os.close(descriptor)
+        if descriptor is not None:
+            os.close(descriptor)
         try:
             temporary.unlink()
         except FileNotFoundError:

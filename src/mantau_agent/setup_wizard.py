@@ -1,43 +1,39 @@
-"""First-run interactive setup -- self-enrolls with the server, discovers
-or manually configures the camera, and writes a `.env` file so no future
-run ever asks again. This is what makes "download the binary and run it"
-actually true, instead of someone hand-running a `curl POST /agents/enroll`
-and setting six environment variables themselves.
-
-`needs_setup()` asks `Settings()` (not the `.env` file directly) whether
-the required fields are already populated -- `Settings` already merges
-`os.environ` and `.env` the same way the real agent run will, so a
-Docker/compose deployment that sets `MANTAU_*` env vars directly is
-correctly recognized as "already configured" and never hits the wizard,
-even though no `.env` file exists on disk in that case.
-"""
+"""Interactive enrollment and validated camera setup with durable state."""
 
 from __future__ import annotations
 
+import asyncio
+import getpass
 import socket
 import sys
 from pathlib import Path
 
 import httpx
+from mantau_core.contracts import CameraRef, Credentials, StreamProfile
 
+from .camera.validate import validate_camera
+from .capabilities import InferenceMode
 from .config import Settings
-from .discovery.onvif import discover as onvif_discover
+from .discovery.service import DiscoveryCandidate, discover_cameras
+from .state import (
+    AgentConfiguration, CameraConfiguration, ConfigurationStore,
+    EnrollmentConfiguration, SetupState,
+)
 
+# Retained for callers migrating from the original .env wizard.
 ENV_PATH = Path(".env")
 
 
-def needs_setup(settings: Settings | None = None) -> bool:
+def needs_setup(settings: Settings | None = None,
+                configuration: AgentConfiguration | None = None) -> bool:
+    if configuration is not None:
+        return configuration.setup_state is not SetupState.COMPLETE or configuration.camera is None
     s = settings or Settings()
     return not (s.agent_id and s.agent_secret and (s.camera_host or s.use_onvif_discovery))
 
 
 def default_agent_id() -> str:
-    """`hostname`-derived so two devices don't collide by default, and so
-    the name shown in `/agents` is recognizable without asking the user to
-    invent one."""
     host = socket.gethostname().lower()
-    # Keep it to characters an operator would expect in an id; a raw
-    # hostname can contain spaces/underscores on some platforms.
     cleaned = "".join(c if c.isalnum() or c == "-" else "-" for c in host).strip("-")
     return f"agent-{cleaned or 'device'}"
 
@@ -55,23 +51,19 @@ def enroll(server_url: str, agent_id: str, *, client: httpx.Client | None = None
 
 
 def render_env_file(*, server_url: str, agent_id: str, secret: str, camera: dict) -> str:
-    """Pure formatting, split out from `run_wizard()` so the actual file
-    contents are unit-testable without a real terminal or network."""
+    """Compatibility helper for existing Docker/.env automation."""
     lines = [
-        f"MANTAU_SERVER_URL={server_url}",
-        f"MANTAU_AGENT_ID={agent_id}",
-        f"MANTAU_AGENT_SECRET={secret}",
-        f"MANTAU_CAMERA_ID={agent_id}-cam",
-        f"MANTAU_CAMERA_HOST={camera['host']}",
-        f"MANTAU_CAMERA_PORT={camera['port']}",
+        f"MANTAU_SERVER_URL={server_url}", f"MANTAU_AGENT_ID={agent_id}",
+        f"MANTAU_AGENT_SECRET={secret}", f"MANTAU_CAMERA_ID={agent_id}-cam",
+        f"MANTAU_CAMERA_HOST={camera['host']}", f"MANTAU_CAMERA_PORT={camera['port']}",
         f"MANTAU_CAMERA_MAIN_PATH={camera['main_path']}",
     ]
     if camera.get("sub_path"):
-        lines.append(f"MANTAU_CAMERA_SUB_PATH={camera['sub_path']}")
-        lines.append("MANTAU_DEFAULT_STREAM_PROFILE=sub")
+        lines.extend((f"MANTAU_CAMERA_SUB_PATH={camera['sub_path']}",
+                      "MANTAU_DEFAULT_STREAM_PROFILE=sub"))
     if camera.get("username"):
-        lines.append(f"MANTAU_CAMERA_USERNAME={camera['username']}")
-        lines.append(f"MANTAU_CAMERA_PASSWORD={camera.get('password', '')}")
+        lines.extend((f"MANTAU_CAMERA_USERNAME={camera['username']}",
+                      f"MANTAU_CAMERA_PASSWORD={camera.get('password', '')}"))
     return "\n".join(lines) + "\n"
 
 
@@ -81,90 +73,131 @@ def _prompt(question: str, default: str = "") -> str:
     return value or default
 
 
-def _pick_camera_interactive() -> dict:
+def _choose_host(candidates: list[DiscoveryCandidate]) -> str:
+    if len(candidates) == 1:
+        host = candidates[0].host
+        print(f"Found one camera at {host}.")
+        return host
+    if candidates:
+        print("Found multiple cameras. Select one explicitly:")
+        for index, candidate in enumerate(candidates, 1):
+            state = "RTSP reachable" if candidate.rtsp_reachable else (
+                f"RTSP {candidate.reachability_error or 'unreachable'}")
+            print(f"  {index}. {candidate.host} ({state})")
+        print(f"  {len(candidates) + 1}. Enter an address manually")
+        while True:
+            choice = _prompt(f"Camera number (1-{len(candidates) + 1})")
+            if choice.isdigit() and 1 <= int(choice) <= len(candidates) + 1:
+                selected = int(choice) - 1
+                return candidates[selected].host if selected < len(candidates) else ""
+            print("Enter one of the displayed numbers; no camera was selected.")
+    print("No ONVIF camera was found; enter the RTSP camera manually.")
+    return ""
+
+
+def _camera_ref(camera_id: str, camera: dict) -> tuple[CameraRef, StreamProfile]:
+    paths = {StreamProfile.MAIN: camera["main_path"]}
+    if camera.get("sub_path"):
+        paths[StreamProfile.SUB] = camera["sub_path"]
+    credentials = None
+    if camera.get("username"):
+        credentials = Credentials(username=camera["username"], password=camera.get("password", ""))
+    profile = StreamProfile.SUB if camera.get("sub_path") else StreamProfile.MAIN
+    return CameraRef(
+        camera_id=camera_id, name=camera_id, host=camera["host"],
+        port=int(camera["port"]), paths=paths, credentials=credentials,
+    ), profile
+
+
+async def _pick_camera_interactive(agent_id: str) -> CameraConfiguration:
+    template = CameraRef(
+        camera_id=f"{agent_id}-cam", name=f"{agent_id}-cam", host="127.0.0.1",
+        paths={StreamProfile.MAIN: "/stream1", StreamProfile.SUB: "/stream2"},
+    )
     print("\nLooking for cameras on this network (ONVIF discovery, 3s)...")
     try:
-        devices = onvif_discover(timeout_s=3.0)
+        candidates = await discover_cameras(template, profile=StreamProfile.SUB)
     except OSError as exc:
-        print(f"  (discovery unavailable: {exc})")
-        devices = []
-    # De-dup while keeping first-seen order -- multiple ProbeMatch replies
-    # from the same device on a noisy network shouldn't show up twice.
-    hosts = list(dict.fromkeys(d.host for d in devices if d.host))
+        print(f"  (discovery unavailable: {type(exc).__name__})")
+        candidates = []
+    host = _choose_host(candidates)
 
-    host = ""
-    if hosts:
-        print("Found:")
-        for i, h in enumerate(hosts, 1):
-            print(f"  {i}. {h}")
-        print(f"  {len(hosts) + 1}. Enter manually")
-        choice = _prompt(f"Pick a camera (1-{len(hosts) + 1})", default="1")
-        idx = int(choice) - 1 if choice.isdigit() else len(hosts)
-        if 0 <= idx < len(hosts):
-            host = hosts[idx]
-    if not host:
-        if not hosts:
-            print("No cameras found automatically (this is normal if the camera "
-                  "doesn't support ONVIF, or the network blocks multicast).")
-        host = _prompt("Camera IP address")
-
-    port = _prompt("RTSP port", default="554")
-    main_path = _prompt("RTSP path for the main stream", default="/stream1")
-    sub_path = _prompt("RTSP path for a lower-bandwidth sub stream (blank if none)")
-    username = _prompt("Camera username (blank if none)")
-    password = _prompt("Camera password") if username else ""
-    return {
-        "host": host, "port": port, "main_path": main_path,
-        "sub_path": sub_path, "username": username, "password": password,
-    }
+    while True:
+        host = host or _prompt("Camera IP address or hostname")
+        port_text = _prompt("RTSP port", default="554")
+        try:
+            port = int(port_text)
+            if not 1 <= port <= 65535:
+                raise ValueError
+        except ValueError:
+            print("RTSP port must be a number from 1 to 65535.")
+            host = ""
+            continue
+        main_path = _prompt("RTSP path for the main stream", default="/stream1")
+        sub_path = _prompt("RTSP path for the low-bitrate/substream (blank if none)")
+        username = _prompt("Camera username (blank if none)")
+        password = getpass.getpass("Camera password: ") if username else ""
+        camera = {
+            "host": host, "port": port, "main_path": main_path,
+            "sub_path": sub_path or None, "username": username or None,
+            "password": password or None,
+        }
+        camera_ref, profile = _camera_ref(f"{agent_id}-cam", camera)
+        print(f"Validating the {'substream' if profile is StreamProfile.SUB else 'main stream'}...")
+        failure = await validate_camera(camera_ref, profile=profile)
+        if failure is None:
+            return CameraConfiguration(
+                camera_id=camera_ref.camera_id, default_stream_profile=profile.value, **camera)
+        print(f"Camera was not saved: {failure}")
+        print("Check the address, RTSP paths, and credentials, then try again.")
+        host = ""
 
 
 _NON_INTERACTIVE_MESSAGE = (
-    "This device isn't enrolled yet, and setup needs an interactive "
-    "terminal (it wasn't given one -- e.g. running under Docker without "
-    "-it, or as a background service).\n"
-    "Either run this once interactively first, or set "
-    "MANTAU_AGENT_ID / MANTAU_AGENT_SECRET / MANTAU_CAMERA_HOST "
-    "(and friends) directly as environment variables."
+    "Setup is incomplete and requires an interactive terminal. Run "
+    "`mantau-agent setup` once, or provide MANTAU_AGENT_ID, "
+    "MANTAU_AGENT_SECRET, and MANTAU_CAMERA_HOST for Docker/CI."
 )
 
 
-def run_wizard(env_path: Path = ENV_PATH) -> None:
+def run_wizard(store: ConfigurationStore | None = None) -> AgentConfiguration:
+    store = store or ConfigurationStore()
     if not sys.stdin.isatty():
-        print(_NON_INTERACTIVE_MESSAGE, file=sys.stderr)
-        sys.exit(1)
-
-    print("=== Mantau agent -- first-time setup ===\n")
-    print("This only runs once. Everything below is saved so future restarts")
-    print("start monitoring immediately.\n")
-
+        raise RuntimeError(_NON_INTERACTIVE_MESSAGE)
+    existing = store.load()
+    print("=== Mantau agent setup ===\n")
     try:
-        server_url = _prompt("Mantau server URL", default="http://localhost:8100")
-        agent_id = _prompt("A name for this device", default=default_agent_id())
-
-        print(f"\nRegistering '{agent_id}' with {server_url} ...")
-        try:
-            secret = enroll(server_url, agent_id)
-        except httpx.HTTPError as exc:
-            print(f"\nCould not reach the server: {exc}")
-            print("Check the server URL and your network connection, then run this again.")
-            sys.exit(1)
-        print("Registered.")
-
-        camera = _pick_camera_interactive()
-    except EOFError:
-        # isatty() can still say True on a technically-console-attached but
-        # actually-empty stdin (observed running a frozen exe under a
-        # redirected/emulated shell) -- this is the real backstop, not just
-        # defensive padding: it's what actually fired in that case.
-        print(f"\n{_NON_INTERACTIVE_MESSAGE}", file=sys.stderr)
-        sys.exit(1)
-    except KeyboardInterrupt:
-        print("\nSetup cancelled.", file=sys.stderr)
-        sys.exit(1)
-
-    env_path.write_text(
-        render_env_file(server_url=server_url, agent_id=agent_id, secret=secret, camera=camera),
-        encoding="utf-8",
+        if existing is not None and existing.enrollment.agent_secret:
+            enrollment = existing.enrollment
+            print(f"Reusing enrollment for {enrollment.agent_id!r}.")
+        else:
+            server_url = _prompt("Mantau server URL", default="http://localhost:8100")
+            agent_id = _prompt("A name for this device", default=default_agent_id())
+            print(f"Registering {agent_id!r} with the server...")
+            try:
+                secret = enroll(server_url, agent_id)
+            except (httpx.HTTPError, KeyError, ValueError) as exc:
+                raise RuntimeError(f"Enrollment failed: {type(exc).__name__}") from exc
+            enrollment = EnrollmentConfiguration(
+                server_url=server_url, agent_id=agent_id, agent_secret=secret)
+            store.save(AgentConfiguration(
+                setup_state=SetupState.ENROLLED, enrollment=enrollment,
+                inference_mode=InferenceMode.AUTO,
+            ))
+        camera = asyncio.run(_pick_camera_interactive(enrollment.agent_id))
+        while True:
+            raw_mode = _prompt("Inference mode (AUTO/EDGE/CLOUD/HYBRID)", default="AUTO").upper()
+            try:
+                inference_mode = InferenceMode(raw_mode)
+                break
+            except ValueError:
+                print("Choose AUTO, EDGE, CLOUD, or HYBRID.")
+    except (EOFError, KeyboardInterrupt) as exc:
+        raise RuntimeError("Setup cancelled; saved enrollment can be resumed") from exc
+    configuration = AgentConfiguration(
+        setup_state=SetupState.COMPLETE, enrollment=enrollment,
+        camera=camera, inference_mode=inference_mode,
     )
-    print(f"\nSaved to {env_path.resolve()}. Starting monitoring now...\n")
+    store.save(configuration)
+    print(f"Configuration validated and saved to {store.path}.")
+    return configuration

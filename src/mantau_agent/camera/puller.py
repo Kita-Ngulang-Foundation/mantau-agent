@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import threading
 import time
+from datetime import datetime, timezone
 
 import cv2
 import numpy as np
@@ -45,6 +46,7 @@ class CameraPuller:
         self.reachable = False
         self.restarts = 0
         self.last_error: str | None = None
+        self.last_frame_at: datetime | None = None
 
     def _open_cv2(self):
         url = self.camera.stream_url(self.profile)
@@ -81,9 +83,13 @@ class CameraPuller:
                     ts_ms = int((time.monotonic() - self._t0) * 1000)
                     with self._lock:
                         self._latest = (image, ts_ms)
+                        self.last_frame_at = datetime.now(timezone.utc)
             except Exception as exc:  # noqa: BLE001 -- this IS the reconnect boundary
                 self.reachable = False
-                self.last_error = f"{type(exc).__name__}: {exc}"
+                # Native capture exceptions can echo the RTSP URL, including
+                # embedded credentials. Keep health useful without persisting
+                # or logging third-party exception text.
+                self.last_error = type(exc).__name__
                 if cap is not None:
                     with contextlib.suppress(Exception):
                         cap.release()
@@ -92,7 +98,10 @@ class CameraPuller:
                     break
                 self.restarts += 1
                 delay = self._backoff.delay_for(attempt)
-                attempt += 1
+                # Once the configured cap has been reached, retaining more
+                # exponent bits cannot change the delay and can eventually
+                # overflow in a months-long outage.
+                attempt = min(attempt + 1, 63)
                 self._stop.wait(delay)
             finally:
                 if cap is not None:

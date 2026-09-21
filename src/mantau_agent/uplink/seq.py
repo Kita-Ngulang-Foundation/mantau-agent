@@ -9,8 +9,13 @@ target hardware (a small board with no UPS), not a theoretical one.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
+
+from ..storage import atomic_write_bytes
+
+
+class CorruptSequenceError(RuntimeError):
+    pass
 
 
 class SeqCounter:
@@ -22,9 +27,15 @@ class SeqCounter:
         if not self._path.exists():
             return 0
         try:
-            return int(self._path.read_text(encoding="utf-8").strip())
-        except (ValueError, OSError):
-            return 0
+            value = int(self._path.read_text(encoding="utf-8").strip())
+        except (ValueError, OSError) as exc:
+            raise CorruptSequenceError(
+                f"Sequence state {self._path} is unreadable; refusing to reuse sequence numbers"
+            ) from exc
+        if value < 0:
+            raise CorruptSequenceError(
+                f"Sequence state {self._path} is negative; refusing to reuse sequence numbers")
+        return value
 
     def next(self) -> int:
         """The next seq to use. Persists BEFORE returning, so a crash right
@@ -36,7 +47,4 @@ class SeqCounter:
         return value
 
     def _write(self, value: int) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-        tmp.write_text(str(value), encoding="utf-8")
-        os.replace(tmp, self._path)
+        atomic_write_bytes(self._path, str(value).encode("ascii"), mode=0o600)

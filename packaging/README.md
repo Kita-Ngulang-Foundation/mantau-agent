@@ -1,70 +1,113 @@
-# Packaging mantau-agent as a standalone binary
+# Linux packaging and installation
 
-Turns "clone the repo, create a venv, pip install, run a module" into
-"download one file and run it" — no Python, git, or pip required on the
-target device. This is what actually makes the agent installable on a
-Raspberry Pi or a spare Linux/Windows box, without setting up a development
-environment. Android is a platform identifier only; no Android runtime is built
-or validated here.
+The agent ships as one PyInstaller binary per Linux architecture. Raspberry Pi
+is the Linux ARM64 deployment profile; it does not have a separate codebase.
 
-`entrypoint.py` is the single script PyInstaller freezes; it just calls
-`mantau_agent.main.main()`, which runs the first-run setup wizard
-(`setup_wizard.py`) on a fresh device and the normal agent loop after that.
+## Build both artifacts
 
-## Windows (build natively, on a Windows machine)
+From `mantau-agent`, with Docker buildx and ARM64 emulation available:
 
-```powershell
-cd mantau-agent
-py -3.12 -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
-.venv\Scripts\python.exe -m pip install pyinstaller
-.venv\Scripts\python.exe -m PyInstaller --onefile --name mantau-agent-windows-x64 `
-  --distpath dist\windows --workpath build\pyi-windows --specpath build `
-  packaging\entrypoint.py
+```sh
+sh packaging/build-linux.sh
 ```
 
-Output: `dist\windows\mantau-agent-windows-x64.exe`.
+Outputs:
 
-## Linux x86_64 and ARM64 (build via Docker — cross-builds via buildx+QEMU)
+- `dist/mantau-agent-linux-x64`
+- `dist/mantau-agent-linux-arm64`
 
-Docker Desktop ships buildx with QEMU emulation already registered, so
-building for `arm64` from an x86_64 host works out of the box — just much
-slower than a native build (expect it to take significantly longer than
-the x86_64 build, since every instruction is emulated).
+The build context is the parent `mantau-prototype` directory because the agent
+depends on the sibling `mantau-core` package. PyInstaller must build on the same
+OS family and architecture it targets; buildx supplies the architecture-specific
+Linux environment. Building is not proof that camera codecs or detector
+accelerators work on a target, so run the resulting artifact on representative
+x86_64 and Raspberry Pi hardware before release.
 
-```powershell
-cd mantau-agent
+To build one artifact manually:
 
-# x86_64 (a generic Linux VM/box)
-docker build --platform linux/amd64 -f packaging\Dockerfile.pyinstaller -t mantau-agent-pyi:amd64 ..
-docker run --rm -v "${PWD}\dist\linux-x64:/out" mantau-agent-pyi:amd64 --name mantau-agent-linux-x64
-
-# arm64 (Raspberry Pi and generic Linux ARM64; Android is not validated)
-docker build --platform linux/arm64 -f packaging\Dockerfile.pyinstaller -t mantau-agent-pyi:arm64 ..
-docker run --rm -v "${PWD}\dist\linux-arm64:/out" --platform linux/arm64 mantau-agent-pyi:arm64 --name mantau-agent-linux-arm64
+```sh
+docker buildx build --load --platform linux/amd64 \
+  -f packaging/Dockerfile.pyinstaller -t mantau-agent-pyi:amd64 ..
+mkdir -p dist
+docker run --rm --platform linux/amd64 \
+  -v "$PWD/dist:/out" mantau-agent-pyi:amd64 \
+  --name mantau-agent-linux-x64
 ```
 
-The build context (`..`) is `mantau-prototype/`, the same as the real
-`Dockerfile` — it needs the `mantau-core` sibling package too.
+Use `linux/arm64`, tag `arm64`, and name `mantau-agent-linux-arm64` for the
+Raspberry Pi/generic ARM64 artifact.
 
-## Verifying a built binary without the real target hardware
+## Install
 
-Run it in a fresh, unrelated base image with the required env vars set —
-if it stays running (rather than crashing), the freeze picked up every
-dependency it needs:
+Copy the matching binary plus `packaging/install.sh` and
+`packaging/systemd/mantau-agent.service` to the target, then run:
 
-```powershell
-docker run --rm --platform linux/amd64 -v "${PWD}\dist\linux-x64:/bin/agent" `
-  -e MANTAU_AGENT_ID=agent-test -e MANTAU_AGENT_SECRET=testsecret -e MANTAU_CAMERA_HOST=192.0.2.1 `
-  debian:12-slim timeout 5 /bin/agent/mantau-agent-linux-x64
+```sh
+sudo sh packaging/install.sh ./mantau-agent-linux-x64
 ```
 
-Exit code `124` (timeout killed a still-running process) means success;
-anything else means the freeze is missing something.
+The idempotent installer:
 
-## What's NOT built here
+- validates the host architecture and installs `/usr/local/bin/mantau-agent`;
+- creates the locked-down `mantau-agent` system user and group;
+- creates `/etc/mantau-agent` and `/var/lib/mantau-agent` as private,
+  service-owned directories;
+- installs the systemd unit with restart, hardening, and explicit writable paths;
+- runs one-time enrollment/camera validation when no configuration exists;
+- enables and starts the service after validated configuration exists.
 
-Android packaging and execution are deferred. The agent can identify Android
-in a capability report, but this repository does not provide an APK,
-foreground service, or a validated Termux installation. The Linux ARM64 build
-must not be treated as a tested Android binary.
+For image creation or another pre-seeded flow, `--no-setup` installs and enables
+the unit without starting it when configuration is absent:
+
+```sh
+sudo sh packaging/install.sh --no-setup ./mantau-agent-linux-arm64
+```
+
+Place a valid `0600` configuration at `/etc/mantau-agent/config.json`, then
+start the unit. Environment overrides can be added with a systemd drop-in; do
+not place secrets directly in the world-readable unit file.
+
+## Upgrade and uninstall
+
+Run the installer again with a new binary. It stops the service, replaces the
+binary and unit, preserves configuration/data, reloads systemd, and starts the
+service again.
+
+Default uninstall preserves enrollment, sequence state, pending envelopes, and
+status so reinstall/recovery remains possible:
+
+```sh
+sudo sh packaging/uninstall.sh
+```
+
+Explicit purge removes those directories and the service account:
+
+```sh
+sudo sh packaging/uninstall.sh --purge
+```
+
+## Safe checks before release
+
+Run the Python suite and shell syntax checks:
+
+```sh
+python -m pytest tests -q
+sh -n packaging/build-linux.sh
+sh -n packaging/install.sh
+sh -n packaging/uninstall.sh
+```
+
+When Docker is available, build both artifacts and run at least these smoke
+checks in a clean Linux container:
+
+```sh
+./dist/mantau-agent-linux-x64 --help
+./dist/mantau-agent-linux-x64 status --json
+```
+
+Repeat the help/status smoke check for ARM64 under an ARM64 runner or buildx/QEMU,
+then validate RTSP capture, service restart, and outage spool recovery on the
+actual target class.
+
+Android packaging and runtime behavior are outside this Linux/Raspberry Pi
+release profile.

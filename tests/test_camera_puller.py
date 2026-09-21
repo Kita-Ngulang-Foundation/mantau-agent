@@ -86,6 +86,18 @@ def test_stop_interrupts_a_long_backoff_wait_promptly():
     assert time.monotonic() - t0 < 1.0
 
 
+def test_capture_error_status_does_not_expose_exception_details():
+    def fails_with_url():
+        raise RuntimeError("rtsp://admin:camera-password@camera/stream")
+
+    puller = CameraPuller(CAMERA, capture_factory=fails_with_url,
+                          backoff=BackoffPolicy(base=5.0, cap=5.0))
+    puller.start()
+    assert _wait_until(lambda: puller.restarts >= 1)
+    puller.stop()
+    assert puller.last_error == "RuntimeError"
+
+
 def test_latest_frame_is_none_before_start():
     puller = CameraPuller(CAMERA, capture_factory=lambda: _FakeCapture([FRAME]))
     assert puller.latest_frame() is None

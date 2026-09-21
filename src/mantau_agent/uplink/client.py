@@ -8,6 +8,7 @@ must never crash the detection loop that found it.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 
 import httpx
 from mantau_core.contracts import Envelope, FallEvent, Heartbeat
@@ -34,6 +35,11 @@ class UplinkClient:
         self._spool = spool
         self._client = client or httpx.AsyncClient(timeout=10.0)
         self._owns_client = client is None
+        self._drain_lock = asyncio.Lock()
+        self._retry_signal = asyncio.Event()
+        self.server_reachable = False
+        self.last_successful_contact: datetime | None = None
+        self.last_error: str | None = None
 
     async def send_event(self, event: FallEvent) -> None:
         envelope = Envelope.for_event(self.agent_id, self._seq.next(), event).sign(self._secret)
@@ -49,36 +55,56 @@ class UplinkClient:
             await self._post(envelope)
         except asyncio.CancelledError:
             self._spool.put(envelope)
+            self._retry_signal.set()
             raise
         except httpx.HTTPError:
             self._spool.put(envelope)
+            self._retry_signal.set()
             return
         # A send just succeeded -- also a good moment to clear anything that
         # piled up during a prior outage, without waiting for a new event.
         await self.drain_spool()
 
     async def _post(self, envelope: Envelope) -> None:
-        resp = await self._client.post(
-            f"{self.server_url}/ingest", json=envelope.model_dump(mode="json")
-        )
-        resp.raise_for_status()
+        try:
+            resp = await self._client.post(
+                f"{self.server_url}/ingest", json=envelope.model_dump(mode="json")
+            )
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            self.server_reachable = False
+            self.last_error = type(exc).__name__
+            raise
+        self.server_reachable = True
+        self.last_error = None
+        self.last_successful_contact = datetime.now(timezone.utc)
 
     async def drain_spool(self, *, max_items: int = 50) -> int:
         """Attempt to send everything spooled, oldest first. Stops at the
         first failure (the tunnel is presumably still down) instead of
         burning through every item's retry on every call."""
-        self._spool.evict_expired()
-        sent = 0
-        for envelope in self._spool.pending(limit=max_items):
-            try:
-                await self._post(envelope)
-            except httpx.HTTPError:
-                self._spool.mark_attempted(envelope)
-                break
-            else:
-                self._spool.ack(envelope)
-                sent += 1
-        return sent
+        async with self._drain_lock:
+            self._spool.evict_expired()
+            sent = 0
+            for envelope in self._spool.pending(limit=max_items):
+                try:
+                    await self._post(envelope)
+                except httpx.HTTPError:
+                    self._spool.mark_attempted(envelope)
+                    self._retry_signal.set()
+                    break
+                else:
+                    self._spool.ack(envelope)
+                    sent += 1
+            if self._spool.depth() == 0:
+                self._retry_signal.clear()
+            return sent
+
+    async def wait_for_retry(self, *, timeout_s: float) -> None:
+        try:
+            await asyncio.wait_for(self._retry_signal.wait(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            pass
 
     async def close(self) -> None:
         if self._owns_client:

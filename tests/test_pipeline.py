@@ -47,6 +47,7 @@ async def pipeline_factory(monkeypatch, tmp_path):
         async def create(**overrides):
             settings = Settings(agent_id="agent", agent_secret="secret", camera_host="localhost",
                                 seq_path=str(tmp_path / "seq"), spool_path=str(tmp_path / "spool.db"),
+                                status_path=str(tmp_path / "status.json"),
                                 poll_interval_s=.001, heartbeat_interval_s=.02, **overrides)
             pipeline = await main.build_pipeline(settings)
             pipelines.append(pipeline)
@@ -74,7 +75,7 @@ async def test_pipeline_starts_captures_reports_truthful_health_and_shuts_down(p
     assert pipeline.health()["capabilities"]["detector_backend"] == "null"
     await pipeline.change_mode(Mode.CLOUD)
     assert pipeline.health()["routing"]["degraded"]
-    await pipeline.shutdown()
+    await asyncio.wait_for(pipeline.shutdown(), .5)
     await pipeline.shutdown()
     assert pipeline.puller.stopped == 1
     assert all(task.done() for task in pipeline._tasks + pipeline.router._tasks)
@@ -126,16 +127,17 @@ async def test_explicit_cloud_does_not_construct_local_detector(pipeline_factory
 
 
 @pytest.mark.parametrize("outcome,expected", [
-    ([OnvifDevice(xaddrs=["http://192.0.2.42/onvif/device_service"])], "192.0.2.42"),
+    ([{"host": "192.0.2.42", "rtsp_reachable": True}], "192.0.2.42"),
     ([], "manual-camera"), (OSError("no multicast"), "manual-camera"),
 ])
 async def test_discovery_reuses_manual_contract_and_falls_back(monkeypatch, outcome, expected):
-    def discover():
+    async def inventory(*args, **kwargs):
         if isinstance(outcome, Exception):
             raise outcome
-        return outcome
+        from mantau_agent.discovery.service import DiscoveryCandidate
+        return [DiscoveryCandidate(**item) for item in outcome]
 
-    monkeypatch.setattr(main, "discover", discover)
+    monkeypatch.setattr(main, "discover_cameras", inventory)
     camera = await main._discover_camera(Settings(
         camera_host="manual-camera", camera_username="user", camera_password="pw",
         camera_sub_path="/sub", use_onvif_discovery=True,

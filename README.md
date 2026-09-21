@@ -1,208 +1,250 @@
-﻿# mantau-agent
+# mantau-agent
 
-LAN camera monitoring with outbound server connections. The pipeline composes
-existing discovery, RTSP capture, samplers, detector adapters, JPEG upload,
-signed event envelopes, SQLite spool, and heartbeat components.
+An unattended Linux agent that discovers or accepts a manual RTSP camera,
+captures the preferred low-bitrate stream, routes sampled frames through the
+configured inference mode, durably uploads events and health, and runs under
+systemd. Raspberry Pi uses the same Linux ARM64 build and code path.
 
 ```text
-manual / ONVIF discovery -> CameraPuller (RTSP, latest frame)
-  -> independent FrameSamplers -> InferenceRouter
-       EDGE   -> Detector -> UplinkClient -> /ingest
-       CLOUD  -> FrameUplink.encode -> InferenceUplink (integration interface)
-       HYBRID -> Detector -> events + rate-limited confirmation frames
-       live   -> FrameUplink -> /cameras/{camera_id}/frame (CLOUD/HYBRID only)
-  event / heartbeat upload failure -> EnvelopeSpool -> DurableSpool (SQLite)
-  health -> existing signed heartbeat + detailed local status/logs
+ONVIF/manual setup -> RTSP validation -> durable config
+    -> CameraPuller (bounded reconnect backoff + jitter, latest frame)
+    -> bounded independent sampling queues
+       EDGE   -> local detector -> signed event uplink
+       CLOUD  -> sampled frame -> server-inference interface
+       HYBRID -> local event + rate-limited server confirmation
+       live   -> existing signed live-view frame endpoint
+    -> SQLite event/heartbeat spool -> prompt retry after connectivity returns
+    -> heartbeat + atomic local status snapshot
 ```
 
-`DetectRunner`, `FrameUplink.run`, and the core detector protocol remain
-available for existing callers. The main process uses `MonitoringPipeline`
-and `InferenceRouter` to give each frame path a separate bounded queue.
+The implementation reuses the existing `CameraPuller`, `FrameSampler`, core
+detector protocol and adapters, `FrameUplink`, signed envelopes, sequence
+counter, SQLite spool, and heartbeat contract. Android is outside this task.
 
-## Platforms and inference modes
+## Operator flow
 
-Platform types identify Linux x86_64, Linux ARM64, Raspberry Pi, and Android.
-Raspberry Pi is identified from the device-tree model; its actual architecture
-is reported separately. Other hosts (including Windows development) report
-`other`. **Android is identification only: no Android build, APK, service,
-or tested Termux deployment is provided by this change.**
+Build or obtain the binary matching the target:
 
-| Mode | Behavior |
+- `mantau-agent-linux-x64` for Linux x86_64.
+- `mantau-agent-linux-arm64` for Linux ARM64, including 64-bit Raspberry Pi OS.
+
+Copy the binary and the `packaging/` directory to the device once, then run:
+
+```sh
+sudo sh packaging/install.sh ./mantau-agent-linux-arm64
+```
+
+The installer creates an unprivileged `mantau-agent` service account and safe
+configuration/data directories, then launches one interactive setup:
+
+1. Enter the Mantau server URL and device name. Enrollment is persisted
+   immediately, so an interrupted camera step does not enroll the same agent
+   again.
+2. ONVIF discovery deduplicates devices by host and probes each one over RTSP.
+   A single result is offered directly. Multiple results always require an
+   explicit numbered choice; Enter never silently selects the first camera.
+3. Use the manual address option for cameras without ONVIF or when multicast is
+   blocked. Enter RTSP port, main path, optional low-bitrate/substream path, and
+   credentials. Password input is hidden.
+4. Setup opens the selected RTSP stream and decodes one frame before saving it.
+   When a substream is configured, setup validates and persists it as the
+   preferred runtime profile.
+5. Choose `AUTO`, `EDGE`, `CLOUD`, or `HYBRID`. The service starts and is enabled
+   for future boots.
+
+After installation and configuration, routine operation requires no SSH or
+interactive login. systemd starts the agent at boot and restarts it after a
+failure; camera and server outages are retried internally. Configuration,
+sequence state, acknowledged spool state, and health survive service restarts.
+
+Useful local service commands are:
+
+```sh
+sudo systemctl status mantau-agent
+sudo journalctl -u mantau-agent -f
+sudo -u mantau-agent /usr/local/bin/mantau-agent \
+  --config /etc/mantau-agent/config.json \
+  --status-path /var/lib/mantau-agent/status.json status --json
+sudo -u mantau-agent /usr/local/bin/mantau-agent \
+  --config /etc/mantau-agent/config.json discover --json
+```
+
+Re-running `install.sh` updates the binary/unit without discarding state. Normal
+uninstall preserves configuration and pending events:
+
+```sh
+sudo sh packaging/uninstall.sh
+```
+
+Only `packaging/uninstall.sh --purge` removes `/etc/mantau-agent`,
+`/var/lib/mantau-agent`, and the service account.
+
+## Camera setup behavior
+
+`discover --json` returns a deduplicated inventory with host, ONVIF metadata,
+RTSP reachability, and classified failure. It never returns camera credentials.
+Discovery only locates a host; the configured RTSP paths remain authoritative
+because ONVIF Media-service `GetProfiles`/`GetStreamUri` negotiation is not
+implemented.
+
+The setup wizard performs both the lightweight RTSP reachability probe and a
+real one-frame OpenCV/FFmpeg read. The frame read is authoritative for cameras
+whose RTSP server rejects unauthenticated `OPTIONS` but accepts credentials on
+the media stream. A configuration is never promoted to `complete` without a
+decoded frame. At runtime, a persisted host is used directly. Environment-only
+deployments may enable ONVIF discovery; one reachable camera is accepted,
+multiple reachable cameras fail with an instruction to run setup, and no result
+falls back to `MANTAU_CAMERA_HOST` when supplied.
+
+## Durable configuration and compatibility
+
+The installed service uses:
+
+| Path | Ownership/mode | Contents |
+|---|---|---|
+| `/etc/mantau-agent/config.json` | `mantau-agent`, `0600` inside a `0700` directory | Versioned enrollment, selected camera, credentials, inference mode, setup state |
+| `/etc/mantau-agent/config.json.bak` | same | Previous validated configuration for explicit rollback |
+| `/var/lib/mantau-agent/seq.txt` | private service state | Monotonic envelope sequence, atomically replaced before use |
+| `/var/lib/mantau-agent/spool.db` | private service state | Unacknowledged signed events and heartbeats |
+| `/var/lib/mantau-agent/status.json` | secret-free snapshot | Local health for `status --json` |
+
+Configuration and sequence writes use write/fsync/atomic-replace. Configuration
+has a strict schema and unknown, truncated, or invalid data fails closed. A
+corrupt sequence file also fails closed instead of restarting from zero and
+reusing an acknowledged sequence number. To explicitly restore the prior
+configuration:
+
+```sh
+sudo systemctl stop mantau-agent
+sudo -u mantau-agent /usr/local/bin/mantau-agent \
+  --config /etc/mantau-agent/config.json setup --restore-backup
+sudo systemctl start mantau-agent
+```
+
+The agent does not log agent secrets or camera passwords. Its status and
+discovery JSON contain no credentials. Linux directory/file permissions are
+the confidentiality boundary; protect device administrator access and backups.
+
+Existing `MANTAU_*` environment variables and `.env` files remain supported for
+Docker and CI. Explicit environment values override durable state. A fully
+environment-configured process does not require `config.json`:
+
+```sh
+MANTAU_SERVER_URL=http://server:8100 \
+MANTAU_AGENT_ID=agent-1 \
+MANTAU_AGENT_SECRET='<secret>' \
+MANTAU_CAMERA_ID=cam-1 \
+MANTAU_CAMERA_HOST=192.168.1.42 \
+MANTAU_CAMERA_SUB_PATH=/stream2 \
+MANTAU_DEFAULT_STREAM_PROFILE=sub \
+MANTAU_INFERENCE_MODE=AUTO \
+python -m mantau_agent.main run
+```
+
+The principal runtime variables are:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MANTAU_CONFIG_PATH` | `data/config.json` | Durable setup state path used by CLI/default run |
+| `MANTAU_SERVER_URL` | `http://localhost:8100` | Server base URL |
+| `MANTAU_AGENT_ID`, `MANTAU_AGENT_SECRET` | empty | Enrollment identity |
+| `MANTAU_CAMERA_HOST`, `MANTAU_CAMERA_PORT` | empty, `554` | Manual/discovery fallback |
+| `MANTAU_CAMERA_MAIN_PATH`, `MANTAU_CAMERA_SUB_PATH` | `/stream1`, unset | RTSP profiles |
+| `MANTAU_DEFAULT_STREAM_PROFILE` | `sub` | Preferred profile; core falls back to main if no sub path exists |
+| `MANTAU_INFERENCE_MODE` | `AUTO` | Requested mode |
+| `MANTAU_DETECTOR_BACKEND` | `null` | `null` or `mediapipe` |
+| `MANTAU_DETECTION_FPS` | `5` | Local sample cap and AUTO throughput target |
+| `MANTAU_CLOUD_UPLOAD_FPS` | `1` | Cloud sample/attempt cap |
+| `MANTAU_HYBRID_CONFIRMATION_FPS` | `0.2` | HYBRID confirmation cap |
+| `MANTAU_LIVE_VIEW_FPS` | `4` | Independent live-view rate |
+| `MANTAU_FRAME_QUEUE_SIZE` | `2` | Pending frames per route; oldest drops first |
+| `MANTAU_SEQ_PATH`, `MANTAU_SPOOL_PATH` | under `data/` | Durable uplink state |
+| `MANTAU_SPOOL_RETRY_BASE_S`, `MANTAU_SPOOL_RETRY_CAP_S` | `0.5`, `15` | Full-jitter exponential server retry bounds |
+| `MANTAU_STATUS_PATH`, `MANTAU_STATUS_INTERVAL_S` | `data/status.json`, `5` | Local status snapshot |
+| `MANTAU_HEARTBEAT_INTERVAL_S` | `30` | Signed server health interval |
+
+## Inference modes and server boundary
+
+| Mode | Effective behavior |
 |---|---|
-| `EDGE` | Local detector; uplink events and health only. Live-view frames are suppressed even if live view is enabled. |
-| `CLOUD` | Sample and upload frames through `InferenceUplink`; never call the local detector. Live view has a separate rate and transport. |
-| `HYBRID` | Local events are sent immediately. Frames associated with real events may be submitted for server confirmation, capped by both the cloud-upload and confirmation rates. Confirmation does not delay or retract an event. |
-| `AUTO` | Deterministically choose EDGE or CLOUD from the capability report. HYBRID requires explicit selection. |
+| `EDGE` | Run the local detector and send real events only. |
+| `CLOUD` | Upload sampled frames through `InferenceUplink`; skip local detection. |
+| `HYBRID` | Send local events immediately and submit explicitly rate-limited event frames for server confirmation. |
+| `AUTO` | Select EDGE only when a production detector initializes, measures at the requested rate, and memory is at least 512 MiB; otherwise select CLOUD with a reason. |
 
-AUTO selects EDGE only when the configured production backend successfully
-initializes and benchmarks at least `detection_fps`, and measured host memory
-is at least 512 MiB. Missing/failed detectors, unknown measurements, low memory,
-or insufficient throughput select CLOUD with an explicit reason. NullDetector
-never qualifies as production inference. This policy does not assume that an
-ARM board is weak or that an accelerator makes a detector fast.
+`NullDetector` remains compatible for wiring tests, but the production router
+suppresses all its output and any event marked `signals.synthetic`. Synthetic
+detections never reach alert or confirmation uplinks.
 
-`CapabilityReport.model_dump_json()` serializes platform, architecture, CPU,
-CPU count, host memory, detected accelerators, usable detector backends,
-software version, detector throughput/error, and recommended mode. The probe
-warms a disposable detector, measures three 320x240 blank frames, discards
-outputs, and closes it; production uses a fresh instance. This is a startup
-throughput estimate, not an accuracy test or a sustained-load benchmark.
-Memory uses host `sysconf` and is unknown where unavailable; accelerator
-probing currently covers OpenCV CUDA devices only. Other accelerators are
-unverified, and an accelerator entry does not imply detector support. Explicit
-CLOUD skips local model construction/probing entirely.
+The current server has `/ingest` for signed events/heartbeats and a live-view
+frame endpoint. It does not expose a server-inference endpoint. CLOUD/HYBRID
+inference is therefore isolated behind `InferenceUplink`; without an injected
+adapter, status reports `cloud_available=false` and `degraded=true`. The agent
+does not invent an endpoint or treat live-view storage as inference. The
+remaining server/core work is an authenticated inference submission contract,
+frame/event correlation and confirmation results, plus a remote capability and
+detailed-health contract.
 
-## Server/core integration boundaries
+## Resilience and health
 
-The checked-in server supports signed `POST /ingest` for events/heartbeats and
-signed `POST /cameras/{camera_id}/frame` for live-view JPEG storage. **That frame
-route performs no inference.** No new server endpoint is assumed or called.
+Camera opens/reads use bounded native timeouts and reconnect forever through
+the core full-jitter exponential backoff. HTTP connections are reused by
+`httpx`; failed events and heartbeats enter the SQLite spool. A dedicated retry
+worker begins promptly when the spool becomes non-empty, uses independently
+bounded full-jitter backoff while offline, and drains oldest-first as soon as a
+request succeeds. A drain lock prevents concurrent recovery workers from
+replaying the same pending envelope. Server dedupe remains the final idempotency
+boundary. Successful acknowledgements delete spool entries durably; the
+monotonic sequence counter prevents reuse across clean restarts.
 
-`uplink/inference.py::InferenceUplink` is the missing server-inference seam.
-A future adapter receives JPEG bytes, camera ID, stream-relative timestamp,
-and optional local event IDs for HYBRID confirmation. Inject it through
-`build_pipeline(settings, inference_uplink=adapter)`. A successful submission
-means accepted, not confirmed. The default CLI has no adapter: CLOUD/HYBRID
-report `cloud_available=false` and `degraded=true`; they do not pretend that
-live-view uploads provide fall detection. HYBRID can still send local events.
+`status --json` reads the atomic, secret-free snapshot without starting camera
+capture. It reports:
 
-Remaining contracts to agree with core/server:
+- camera connectivity, last frame time, last error, and reconnect count;
+- effective inference mode and detector backend/liveness;
+- uplink connectivity, last error, and last successful server contact;
+- spool depth, queue/drop/upload details, version, PID, start time, and uptime.
 
-- Authenticated inference submission and acceptance semantics, frame IDs,
-  timestamps, idempotency, and confirmation/event correlation.
-- Server-side detector execution and a confirmation-result contract. The
-  current interface submits work only; it does not invent confirmation results.
-- Capability and detailed health registration. These reports are currently
-  available locally/logged; core's existing heartbeat fields stay unchanged.
-- Any durable frame replay/retention contract. Frames currently drop on failure
-  and never enter the event spool, matching the existing live-view behavior.
+If the recorded PID no longer exists, the command marks the snapshot stopped
+and clears camera/uplink connectivity rather than reporting stale liveness.
 
-`mantau-core` supplies `Detector`, `FallEvent`, signed `Envelope`, `Heartbeat`,
-resilience helpers, and `DurableSpool`. MediaPipe continues through its existing
-adapter, which requires `mantau.api.streaming.StreamingDetector` from the
-optional detection dependency. Explicit EDGE/HYBRID retain its actionable
-ImportError when missing; AUTO records the error and selects CLOUD.
+Shutdown stops admission, drains active detector/event work, interrupts retry
+waits, releases RTSP/native resources, writes a stopped status snapshot, closes
+HTTP and SQLite, and lowers the tunnel. Pending envelopes and acknowledged
+state remain durable for the next systemd start.
 
-NullDetector remains silent by default. Its synthetic trigger is still usable
-in standalone `DetectRunner` tests, but **the production router suppresses all
-NullDetector events and events marked `signals.synthetic`**, counts them in
-health, and never sends them for alerts or cloud confirmation. The current
-server has no safe synthetic-alert channel.
+## Prevent desktop Linux sleep
 
-## Install and run
+An unattended laptop or desktop must remain awake when its lid/display policy
+would otherwise suspend it. On a dedicated appliance, disable system sleep:
+
+```sh
+sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+```
+
+On a laptop, also configure `/etc/systemd/logind.conf` as appropriate for the
+site, for example `HandleLidSwitch=ignore`, then restart `systemd-logind` or
+reboot. This changes host-wide power behavior; coordinate it with the device
+owner and ensure ventilation/power are suitable. Display blanking may remain
+enabled because the agent is headless.
+
+## Development and verification
 
 Requires Python 3.10-3.12 and the sibling `../mantau-core` checkout.
 
 ```powershell
 py -3.12 -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
-.venv\Scripts\python.exe -m mantau_agent.main
-```
-
-First run uses the existing enrollment/camera setup wizard. For unattended
-operation, enroll with the server first (see `../mantau-server/README.md`), then:
-
-```powershell
-$env:MANTAU_SERVER_URL = "http://localhost:8100"
-$env:MANTAU_AGENT_ID = "agent-1"
-$env:MANTAU_AGENT_SECRET = "<enrollment secret>"
-$env:MANTAU_CAMERA_ID = "cam-1"
-$env:MANTAU_CAMERA_HOST = "192.168.1.42"
-$env:MANTAU_INFERENCE_MODE = "AUTO"
-.venv\Scripts\python.exe -m mantau_agent.main
-```
-
-Without a real detector or server-inference adapter, the default configuration
-provides capture, live view, and health, **not production fall detection**.
-Packaging instructions for Windows/Linux are in `packaging/README.md`.
-
-## Configuration
-
-All settings use the `MANTAU_` prefix and the existing environment/`.env` loading.
-Rates and queue bounds must be positive and finite; use the enabled flag to
-turn off live view. No dependency changes are required.
-
-| Setting (omit `MANTAU_` below) | Default | Purpose |
-|---|---|---|
-| `SERVER_URL` | `http://localhost:8100` | Existing server base URL |
-| `AGENT_ID`, `AGENT_SECRET` | required | Enrollment identity/secret |
-| `CAMERA_ID`, `CAMERA_HOST`, `CAMERA_PORT` | `cam-1`, empty, `554` | Camera identity/address |
-| `CAMERA_MAIN_PATH`, `CAMERA_SUB_PATH` | `/stream1`, unset | Existing RTSP paths |
-| `CAMERA_USERNAME`, `CAMERA_PASSWORD` | unset | Camera credentials |
-| `USE_ONVIF_DISCOVERY` | `false` | Discover a host; fall back to manual config on no result/network error |
-| `DEFAULT_STREAM_PROFILE` | `sub` | Existing sub/main selection |
-| `INFERENCE_MODE` | `AUTO` | `EDGE`, `CLOUD`, `HYBRID`, `AUTO` |
-| `DETECTOR_BACKEND` | `null` | `null` or `mediapipe` |
-| `NULL_DETECTOR_TRIGGER_EVERY` | unset | Synthetic testing only; router suppresses outputs |
-| `DETECTION_FPS` | `5` | Detection frame-sampling cap and AUTO throughput target |
-| `SAMPLER_KEEP_EVERY_N`, `SAMPLER_MAX_FPS` | `1`, unset | Additional legacy detection decimation |
-| `CLOUD_UPLOAD_FPS` | `1` | Cloud frame sampling/upload-attempt cap |
-| `HYBRID_CONFIRMATION_FPS` | `0.2` | At most one confirmation attempt per 5 seconds; also capped by cloud FPS |
-| `LIVE_VIEW_ENABLED`, `LIVE_VIEW_FPS` | `true`, `4` | Independent live-view path (suppressed in EDGE) |
-| `LIVE_VIEW_JPEG_QUALITY`, `LIVE_VIEW_MAX_WIDTH` | `70`, `640` | Shared FrameUplink JPEG encoder settings |
-| `FRAME_QUEUE_SIZE` | `2` | Maximum pending frames per detection/cloud/live queue |
-| `UPLOAD_TIMEOUT_S` | `5` | Per frame-upload timeout |
-| `POLL_INTERVAL_S` | `0.02` | Capture handoff polling interval |
-| `TUNNEL_PROVIDER` | `null` | Existing direct or `tailscale` transport |
-| `SEQ_PATH`, `SPOOL_PATH` | `data/seq.txt`, `data/spool.db` | Persistent sequence and event/heartbeat spool |
-| `SPOOL_TTL_S` | `300` | Existing core TTL; expired envelopes evicted during send/replay |
-| `HEARTBEAT_INTERVAL_S` | `30` | Health and opportunistic spool-recovery cadence |
-
-Queues drop oldest pending frames to retain recent work. Each worker holds at
-most one additional active frame; capture retains one latest frame. Queue bounds
-count frames, not bytes. Detection, JPEG encoding, and RTSP capture run off the
-event loop. Upload attempts (including failures) are rate limited using monotonic
-time; switching modes does not reset that budget. Slow consumers cannot grow
-frame memory without bound. Sampled frames with duplicate/older capture
-timestamps are ignored.
-
-## Lifecycle and health
-
-```python
-pipeline = await build_pipeline(settings, inference_uplink=adapter)
-try:
-    await pipeline.start()             # idempotent
-    await pipeline.change_mode(InferenceMode.HYBRID)
-    status = pipeline.health()         # JSON-serializable local diagnostics
-finally:
-    await pipeline.shutdown()          # idempotent, including before start
-```
-
-Mode changes pause admission, discard pending frames, wait for active work,
-and then apply the selected mode. Shutdown stops capture, finishes active
-inference/event delivery, joins workers, closes detectors/clients/SQLite, and
-brings down the tunnel. Queued frames are disposable; failed or cancelled event
-sends retain signed envelopes for replay. Restart after shutdown uses a new
-pipeline. Detector `push`/`close` must return: a hung native inference call
-cannot safely be killed in a Python thread, so shutdown waits for it rather
-than closing its resources concurrently. RTSP open/read calls request 1.5s
-native timeouts; a capture that fails to stop within 2s reports a shutdown error.
-
-Existing heartbeats carry camera reachability, real local detector status
-(false for CLOUD/NullDetector), and combined pending-frame/spool depth. Detailed
-local health includes mode/reason, cloud availability, degradation, per-path
-queue sizes/drops/upload failures, synthetic suppression, and last worker error.
-Capabilities log at startup; routing health logs at each heartbeat. Replay
-remains opportunistic on successful event/heartbeat sends.
-
-## Tests and verification limits
-
-```powershell
 .venv\Scripts\python.exe -m pytest tests -q
 ```
 
-The suite exercises all modes, deterministic AUTO/weak-device selection,
-serialization/platform identification, independent rates, bounded queues,
-synthetic suppression, upload errors/timeouts, durable event recovery, discovery
-fallback, mode changes, and shutdown. Existing RTSP/ONVIF socket, HMAC golden
-contract, SQLite, and setup/factory tests remain in the full suite. Tests use
-local sockets, mock HTTP, and injected detectors; no camera/server/account is
-required. On Windows sandboxes with owner-only pytest directory restrictions,
-run tests with normal filesystem permissions and a fresh `--basetemp` directory.
+The suite uses local sockets, mock HTTP, injected captures/detectors, and real
+SQLite files. It covers discovery deduplication and ambiguity, RTSP validation,
+configuration interruption/corruption/rollback, environment precedence,
+queue/rate behavior, every inference mode, prompt outage recovery, durable
+acknowledgements, JSON status/discovery, shutdown, and packaging invariants.
 
-Real Linux ARM/Raspberry Pi hardware, MediaPipe model accuracy/performance,
-ONVIF multicast, Tailscale, Docker/binary packaging, and server inference are
-not validated by this suite. ONVIF discovery only locates hosts; Media-service
-`GetProfiles`/`GetStreamUri` negotiation remains unimplemented. Configured RTSP
-paths and credentials are reused. No changes to core, server, or app are needed
-for the existing event/live-view/heartbeat contracts.
+Hardware ONVIF multicast, real camera credential variants, MediaPipe model
+accuracy/sustained throughput, Tailscale, systemd execution on an actual Linux
+host, and cross-built binaries require target/integration verification. Build
+and packaging commands are documented in `packaging/README.md`.
