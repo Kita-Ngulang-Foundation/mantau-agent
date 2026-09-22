@@ -20,6 +20,7 @@ from . import __version__
 from .camera.puller import CameraPuller
 from .capabilities import InferenceMode, inspect_capabilities
 from .config import Settings, load_settings
+from .control import CommandExecutor, CompletedCommandStore, ControlPlaneWorker
 from .detect.router import InferenceRouter
 from .detect.sampler import FrameSampler
 from .discovery.service import discover_cameras
@@ -105,7 +106,8 @@ def _probe_capabilities(settings: Settings):
 
 
 async def build_pipeline(settings: Settings, *,
-                         inference_uplink: InferenceUplink | None = None) -> MonitoringPipeline:
+                         inference_uplink: InferenceUplink | None = None,
+                         configuration_store=None) -> MonitoringPipeline:
     """Cloud adapter is injected until core/server publish an inference contract.
 
     Ownership of the injected adapter transfers to the returned pipeline only
@@ -160,20 +162,30 @@ async def build_pipeline(settings: Settings, *,
             status_store=StatusStore(settings.status_path),
             status_interval_s=settings.status_interval_s,
         )
+        if settings.command_channel_enabled:
+            executor = CommandExecutor(
+                settings, pipeline, config_store=configuration_store,
+                restart_requested=pipeline.restart_requested.set)
+            pipeline.control_worker = ControlPlaneWorker(
+                settings.server_url, settings.agent_id, settings.agent_secret, executor,
+                CompletedCommandStore(settings.command_state_path, secret=settings.agent_secret),
+                poll_interval_s=settings.command_poll_interval_s,
+            )
         cleanup.pop_all()
     logging.getLogger(__name__).info("Agent capabilities: %s", capabilities.model_dump_json())
     logging.getLogger(__name__).warning("Inference routing: %s", router.health())
     return pipeline
 
 
-async def run(settings: Settings | None = None) -> None:
+async def run(settings: Settings | None = None, *, config_path=None) -> None:
     if settings is None:
         settings, configuration = load_settings()
         from .setup_wizard import needs_setup
         if needs_setup(settings, configuration):
             raise RuntimeError(
                 "Setup is incomplete; run `mantau-agent setup` or provide MANTAU_* variables")
-    pipeline = await build_pipeline(settings)
+    from .state import ConfigurationStore
+    pipeline = await build_pipeline(settings, configuration_store=ConfigurationStore(config_path))
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -184,7 +196,12 @@ async def run(settings: Settings | None = None) -> None:
 
     try:
         await pipeline.start()
-        await stop_event.wait()
+        waiters = (asyncio.create_task(stop_event.wait()),
+                   asyncio.create_task(pipeline.restart_requested.wait()))
+        _, pending = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
     finally:
         await pipeline.shutdown()
 
@@ -281,7 +298,7 @@ def cli(argv: list[str] | None = None) -> int:
         if needs_setup(settings, configuration):
             raise RuntimeError(
                 "Setup is incomplete; run `mantau-agent setup` or provide MANTAU_* variables")
-        asyncio.run(run(settings))
+        asyncio.run(run(settings, config_path=args.config))
         return 0
     except (RuntimeError, ValueError, OSError) as exc:
         # Deliberately never include settings/config representations here: both

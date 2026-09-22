@@ -8,6 +8,7 @@ dependencies = [
     "httpx>=0.27",
     "opencv-python-headless>=4.9",  # runs headless on the target hardware; never opens a display
     "numpy>=1.26,<2.3",
+    "cryptography>=42",
     # mantau-core is NOT listed here -- see README "Installing mantau-core".
     # Not published anywhere yet; requirements.txt installs it from the
     # local sibling checkout.

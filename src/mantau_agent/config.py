@@ -75,6 +75,9 @@ class Settings(CoreSettings):
     spool_retry_cap_s: float = Field(default=15.0, gt=0, allow_inf_nan=False)
     status_path: str = "data/status.json"
     status_interval_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+    command_channel_enabled: bool = False
+    command_poll_interval_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+    command_state_path: str = "data/commands.json"
 
 
 def load_settings(path=None) -> tuple[Settings, object | None]:

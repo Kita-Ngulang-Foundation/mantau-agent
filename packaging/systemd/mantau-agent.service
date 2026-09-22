@@ -11,12 +11,13 @@ User=mantau-agent
 Group=mantau-agent
 ExecStartPre=/usr/bin/test -r /etc/mantau-agent/config.json
 ExecStart=/usr/local/bin/mantau-agent --config /etc/mantau-agent/config.json run
-Restart=on-failure
+Restart=always
 RestartSec=5
 TimeoutStopSec=20
 Environment=MANTAU_SEQ_PATH=/var/lib/mantau-agent/seq.txt
 Environment=MANTAU_SPOOL_PATH=/var/lib/mantau-agent/spool.db
 Environment=MANTAU_STATUS_PATH=/var/lib/mantau-agent/status.json
+Environment=MANTAU_COMMAND_STATE_PATH=/var/lib/mantau-agent/commands.json
 Environment=PYTHONUNBUFFERED=1
 UMask=0077
 NoNewPrivileges=true

@@ -22,7 +22,7 @@ class MonitoringPipeline:
                  heartbeat_interval_s: float = 30.0,
                  spool_backoff: BackoffPolicy | None = None,
                  status_store: StatusStore | None = None,
-                 status_interval_s: float = 5.0) -> None:
+                 status_interval_s: float = 5.0, control_worker=None) -> None:
         self.puller, self.router = puller, router
         self.uplink, self.spool, self.tunnel = uplink, spool, tunnel
         self.poll_interval_s = poll_interval_s
@@ -36,6 +36,8 @@ class MonitoringPipeline:
         self._spool_backoff = spool_backoff or BackoffPolicy(base=0.5, cap=15.0)
         self._status_store = status_store
         self._status_interval_s = status_interval_s
+        self.control_worker = control_worker
+        self.restart_requested = asyncio.Event()
         self.heartbeat = HeartbeatLoop(
             agent_id, camera_id, uplink, interval_s=heartbeat_interval_s,
             camera_reachable=lambda: puller.reachable,
@@ -67,6 +69,9 @@ class MonitoringPipeline:
                 if self._status_store is not None:
                     self._tasks.append(asyncio.create_task(
                         self._write_status_loop(), name="pipeline-status"))
+                if self.control_worker is not None:
+                    self._tasks.append(asyncio.create_task(
+                        self.control_worker.run(self._stop), name="pipeline-control"))
                 self._started = True
             except BaseException:
                 await self._shutdown()
@@ -194,4 +199,8 @@ class MonitoringPipeline:
                             try:
                                 self.spool.close()
                             finally:
-                                await self.tunnel.down()
+                                try:
+                                    if self.control_worker is not None:
+                                        await self.control_worker.close()
+                                finally:
+                                    await self.tunnel.down()

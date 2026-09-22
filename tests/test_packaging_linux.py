@@ -7,10 +7,11 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_systemd_unit_runs_unprivileged_with_restart_and_safe_paths():
     unit = (ROOT / "packaging/systemd/mantau-agent.service").read_text(encoding="utf-8")
     assert "User=mantau-agent" in unit
-    assert "Restart=on-failure" in unit
+    assert "Restart=always" in unit  # remote restart exits cleanly and must relaunch
     assert "MANTAU_CONFIG_PATH" not in unit  # supplied explicitly as a CLI argument
     assert "/etc/mantau-agent/config.json run" in unit
     assert "MANTAU_SPOOL_PATH=/var/lib/mantau-agent/spool.db" in unit
+    assert "MANTAU_COMMAND_STATE_PATH=/var/lib/mantau-agent/commands.json" in unit
     assert "ProtectSystem=strict" in unit
     assert "UMask=0077" in unit
 

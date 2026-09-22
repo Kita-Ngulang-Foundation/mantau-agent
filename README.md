@@ -35,7 +35,10 @@ sudo sh packaging/install.sh ./mantau-agent-linux-arm64
 ```
 
 The installer creates an unprivileged `mantau-agent` service account and safe
-configuration/data directories, then launches one interactive setup:
+configuration/data directories, then launches one interactive setup. The
+installed systemd unit uses `Restart=always`, so remote restart/reconfigure
+commands can exit cleanly and be relaunched (an explicit `systemctl stop` is
+still respected):
 
 1. Enter the Mantau server URL and device name. Enrollment is persisted
    immediately, so an interrupted camera step does not enroll the same agent
@@ -107,6 +110,7 @@ The installed service uses:
 | `/var/lib/mantau-agent/seq.txt` | private service state | Monotonic envelope sequence, atomically replaced before use |
 | `/var/lib/mantau-agent/spool.db` | private service state | Unacknowledged signed events and heartbeats |
 | `/var/lib/mantau-agent/status.json` | secret-free snapshot | Local health for `status --json` |
+| `/var/lib/mantau-agent/commands.json` | private service state | Final results plus encrypted in-flight command custody for restart recovery |
 
 Configuration and sequence writes use write/fsync/atomic-replace. Configuration
 has a strict schema and unknown, truncated, or invalid data fails closed. A
@@ -162,6 +166,35 @@ The principal runtime variables are:
 | `MANTAU_SPOOL_RETRY_BASE_S`, `MANTAU_SPOOL_RETRY_CAP_S` | `0.5`, `15` | Full-jitter exponential server retry bounds |
 | `MANTAU_STATUS_PATH`, `MANTAU_STATUS_INTERVAL_S` | `data/status.json`, `5` | Local status snapshot |
 | `MANTAU_HEARTBEAT_INTERVAL_S` | `30` | Signed server health interval |
+| `MANTAU_COMMAND_CHANNEL_ENABLED` | `false` | Opt into the additive authenticated command poller after the server is ready |
+| `MANTAU_COMMAND_POLL_INTERVAL_S` | `5` | Poll delay; polling runs in its own asyncio task and never blocks capture/inference |
+| `MANTAU_COMMAND_STATE_PATH` | `data/commands.json` | Durable completed-command ledger |
+
+## Remote control-plane flow
+
+When `MANTAU_COMMAND_CHANNEL_ENABLED=true`, the agent authenticates with the
+same enrolled id/secret used by signed ingest. A separate task reports
+secret-free capability/health metadata, polls for commands, acknowledges
+`running`, executes locally, persists the final structured result, and then
+uploads it. In-flight commands are encrypted locally with a key derived from
+the enrolled agent secret before the server is allowed to erase its encrypted
+credential blob. Persist-before-upload means a response lost during restart is
+resent without repeating a completed discovery, camera operation, mode change,
+restart, or reconfigure command.
+
+Discovery reuses the ONVIF/RTSP implementation; camera tests reuse one-frame
+validation; configuration is atomically saved to the existing versioned config;
+mode changes use the live router and durable config; restart/reconfigure exits
+cleanly so systemd applies the change. Credential-bearing command payloads are
+never logged. They exist only in memory while executing and in the private
+durable camera configuration after an accepted configuration command.
+
+Compatibility/rollback: polling is off by default, so an upgraded agent behaves
+like the old version until the server control plane is enabled. During mixed
+rollout, old agents continue ingest/heartbeats and never consume queued work.
+To roll back, disable command polling and restart the service; event/frame
+uplinks and existing configuration are unchanged. The server may retain command
+history and additive tables without affecting the old agent.
 
 ## Inference modes and server boundary
 
@@ -176,8 +209,9 @@ The principal runtime variables are:
 suppresses all its output and any event marked `signals.synthetic`. Synthetic
 detections never reach alert or confirmation uplinks.
 
-The current server has `/ingest` for signed events/heartbeats and a live-view
-frame endpoint. It does not expose a server-inference endpoint. CLOUD/HYBRID
+The server has `/ingest` for signed events/heartbeats, a live-view frame
+endpoint, and the optional authenticated control plane above. It still does not
+expose a server-inference endpoint. CLOUD/HYBRID
 inference is therefore isolated behind `InferenceUplink`; without an injected
 adapter, status reports `cloud_available=false` and `degraded=true`. The agent
 does not invent an endpoint or treat live-view storage as inference. The
