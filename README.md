@@ -1,9 +1,21 @@
 # mantau-agent
 
-An unattended Linux agent that discovers or accepts a manual RTSP camera,
-captures the preferred low-bitrate stream, routes sampled frames through the
-configured inference mode, durably uploads events and health, and runs under
-systemd. Raspberry Pi uses the same Linux ARM64 build and code path.
+Mantau has two separate installable agent runtimes with one control-plane
+contract:
+
+- the Python agent for unattended Linux and 64-bit Raspberry Pi devices;
+- the native Kotlin Android Agent under `android-agent/` for a spare phone that
+  remains at home on the CCTV LAN.
+
+Both use the shared claim, agent ID, capability, health, camera, command, and
+inference-mode wire models from `mantau-core`. Android reports platform
+`android`. The Android Agent is not `mantau-app`; RTSP, ONVIF, and monitoring
+remain outside the Flutter control app.
+
+The Linux/Pi agent discovers or accepts a manual RTSP camera, captures the
+preferred low-bitrate stream, routes sampled frames through the configured
+inference mode, durably uploads events and health, and runs under systemd.
+Raspberry Pi uses the same Linux ARM64 build and code path.
 
 ```text
 ONVIF/manual setup -> RTSP validation -> durable config
@@ -17,11 +29,13 @@ ONVIF/manual setup -> RTSP validation -> durable config
     -> heartbeat + atomic local status snapshot
 ```
 
-The implementation reuses the existing `CameraPuller`, `FrameSampler`, core
+The Linux/Pi implementation reuses the existing `CameraPuller`, `FrameSampler`, core
 detector protocol and adapters, `FrameUplink`, signed envelopes, sequence
-counter, SQLite spool, and heartbeat contract. Android is outside this task.
+counter, SQLite spool, and heartbeat contract. The Android implementation uses
+the same v1 control payloads but intentionally has no inference or cloud-frame
+upload in this release.
 
-## Operator flow
+## Linux / Raspberry Pi installation
 
 Build or obtain the binary matching the target:
 
@@ -81,6 +95,28 @@ sudo sh packaging/uninstall.sh
 
 Only `packaging/uninstall.sh --purge` removes `/etc/mantau-agent`,
 `/var/lib/mantau-agent`, and the service account.
+
+## Android Agent installation
+
+Build the independent native project with Android SDK 36 and JDK 17 or 21:
+
+```powershell
+cd android-agent
+.\gradlew.bat testDebugUnitTest assembleDebug
+adb install -r app\build\outputs\apk\debug\app-debug.apk
+```
+
+Open **Mantau Agent** on the spare Android 8.0+ phone, enter the server URL and
+device name, enroll, then copy its claim code into `mantau-app`. Discover ONVIF
+cameras only while the phone is connected to the CCTV Wi-Fi, or use manual
+IP/RTSP configuration. Select a substream path when available, save, grant the
+notification permission, and start the foreground monitoring service.
+
+Android identity/configuration is stored in private app storage; agent/camera
+secrets and in-flight credential-bearing commands are encrypted with an Android
+Keystore AES-GCM key. The persistent notification reports failure/degraded
+state without credentials. See `android-agent/README.md` for Android build,
+installation, permission, security, RTSP, and hardware-test details.
 
 ## Camera setup behavior
 

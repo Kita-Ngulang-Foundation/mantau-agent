@@ -1,0 +1,299 @@
+package id.mantau.agent.service
+
+import android.content.Context
+import id.mantau.agent.discovery.AndroidWsDiscovery
+import id.mantau.agent.model.AgentConfig
+import id.mantau.agent.model.CameraConfig
+import id.mantau.agent.model.CameraConnectivity
+import id.mantau.agent.model.CommandResult
+import id.mantau.agent.model.ControlCommand
+import id.mantau.agent.model.HealthState
+import id.mantau.agent.model.RuntimeStatus
+import id.mantau.agent.model.WirePayloads
+import id.mantau.agent.model.optNullableString
+import id.mantau.agent.network.CommandLedger
+import id.mantau.agent.network.ControlPlaneClient
+import id.mantau.agent.rtsp.LatestFrameBuffer
+import id.mantau.agent.rtsp.ReconnectPolicy
+import id.mantau.agent.rtsp.RtspAuthenticationException
+import id.mantau.agent.rtsp.RtspClient
+import id.mantau.agent.rtsp.RtspException
+import id.mantau.agent.rtsp.RtspState
+import id.mantau.agent.storage.AgentConfigStore
+import id.mantau.agent.storage.AndroidKeystoreSecretStore
+import id.mantau.agent.storage.RuntimeStatusStore
+import org.json.JSONArray
+import org.json.JSONObject
+import java.time.Instant
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+
+class MonitoringEngine(
+    private val context: Context,
+    private val onStatus: (RuntimeStatus) -> Unit = {},
+) : AutoCloseable {
+    private val running = AtomicBoolean(false)
+    private val lifecycle = MonitoringLifecycle()
+    private val configStore = AgentConfigStore(context)
+    private val statusStore = RuntimeStatusStore(context)
+    private val secrets = AndroidKeystoreSecretStore(context)
+    private val ledger = CommandLedger(context, secrets)
+    private val control = ControlPlaneClient()
+    private val discovery = AndroidWsDiscovery(context)
+    private val frames = LatestFrameBuffer(2)
+    private var executor = Executors.newFixedThreadPool(2)
+    @Volatile private var activeRtsp: RtspClient? = null
+    @Volatile private var runtime = RuntimeStatus()
+    private var lastPersistedFrameSecond = -1L
+
+    @Synchronized
+    fun start() {
+        if (!lifecycle.beginStart()) return
+        if (executor.isShutdown) executor = Executors.newFixedThreadPool(2)
+        running.set(true)
+        publish(RuntimeStatus(running = true, health = HealthState.ONLINE, rtspState = "connecting"))
+        executor.submit(::captureLoop)
+        executor.submit(::controlLoop)
+        lifecycle.markRunning()
+    }
+
+    @Synchronized
+    fun stop() {
+        if (!lifecycle.beginStop()) return
+        running.set(false)
+        activeRtsp?.close()
+        executor.shutdownNow()
+        executor.awaitTermination(3, TimeUnit.SECONDS)
+        publish(runtime.copy(
+            running = false,
+            health = HealthState.STOPPED,
+            cameraConnectivity = CameraConnectivity.DISCONNECTED,
+            rtspState = "stopped",
+            explanation = null,
+        ))
+        lifecycle.markStopped()
+    }
+
+    override fun close() = stop()
+
+    fun restartCapture() {
+        activeRtsp?.close()
+    }
+
+    private fun captureLoop() {
+        val reconnect = ReconnectPolicy()
+        var reconnects = 0
+        while (running.get()) {
+            val config = safeConfig() ?: break
+            val camera = config.camera
+            if (camera == null) {
+                publish(runtime.copy(
+                    health = HealthState.DEGRADED,
+                    cameraConnectivity = CameraConnectivity.UNKNOWN,
+                    rtspState = "stopped",
+                    explanation = "Camera configuration is required.",
+                ))
+                interruptibleSleep(1_000)
+                continue
+            }
+            val rtsp = RtspClient()
+            activeRtsp = rtsp
+            try {
+                rtsp.stream(camera, configStore.cameraPassword(), frames, { !running.get() }, object : RtspClient.Listener {
+                    override fun onState(state: RtspState) {
+                        publish(runtime.copy(
+                            rtspState = state.name.lowercase(),
+                            cameraConnectivity = if (state == RtspState.STREAMING) CameraConnectivity.CONNECTED
+                                else runtime.cameraConnectivity,
+                        ))
+                    }
+
+                    override fun onFrame(frame: id.mantau.agent.rtsp.EncodedFrame) {
+                        reconnect.reset()
+                        val second = frame.capturedAt.epochSecond
+                        if (second != lastPersistedFrameSecond) {
+                            lastPersistedFrameSecond = second
+                            publish(runtime.copy(
+                                health = HealthState.ONLINE,
+                                cameraConnectivity = CameraConnectivity.CONNECTED,
+                                lastFrameAt = frame.capturedAt,
+                                explanation = null,
+                                rtspState = "streaming",
+                            ))
+                        }
+                    }
+                })
+            } catch (exception: Exception) {
+                if (!running.get()) break
+                reconnects++
+                publish(runtime.copy(
+                    health = HealthState.DEGRADED,
+                    cameraConnectivity = CameraConnectivity.DISCONNECTED,
+                    rtspState = "backing_off",
+                    reconnectCount = reconnects,
+                    explanation = safeFailure("Camera connection failed", exception),
+                ))
+            } finally {
+                rtsp.close()
+                if (activeRtsp === rtsp) activeRtsp = null
+            }
+            if (!running.get()) break
+            interruptibleSleep(reconnect.nextDelayMs())
+        }
+    }
+
+    private fun controlLoop() {
+        while (running.get()) {
+            val config = safeConfig()
+            val secret = runCatching { configStore.agentSecret() }.getOrNull()
+            if (config == null || config.serverUrl.isBlank() || secret.isNullOrBlank()) {
+                publish(runtime.copy(
+                    health = HealthState.DEGRADED,
+                    explanation = "Control-plane enrollment is required.",
+                ))
+                interruptibleSleep(POLL_INTERVAL_MS)
+                continue
+            }
+            try {
+                val status = WirePayloads.status(context, config, runtime, enrolled = true)
+                val command = control.poll(config.serverUrl, config.agentId, secret, status)
+                if (!running.get()) break
+                publish(runtime.copy(lastControlContactAt = Instant.now(), explanation = cameraExplanation()))
+                if (command != null) handleCommand(config, secret, command)
+            } catch (exception: Exception) {
+                if (running.get()) publish(runtime.copy(
+                    health = HealthState.DEGRADED,
+                    explanation = safeFailure("Control-plane connection failed", exception),
+                ))
+            }
+            interruptibleSleep(POLL_INTERVAL_MS)
+        }
+    }
+
+    private fun handleCommand(config: AgentConfig, secret: String, delivered: ControlCommand) {
+        ledger.completed(delivered.commandId)?.let {
+            control.submitResult(config.serverUrl, config.agentId, secret, it)
+            return
+        }
+        val command = ledger.inflight(delivered.commandId) ?: delivered.also(ledger::putInflight)
+        if (Instant.parse(command.expiresAt).isBefore(Instant.now())) {
+            val expired = CommandResult(
+                command.commandId, "failed", "expired", "Command expired before execution.",
+            )
+            ledger.putCompleted(expired)
+            control.submitResult(config.serverUrl, config.agentId, secret, expired)
+            return
+        }
+        control.submitResult(
+            config.serverUrl, config.agentId, secret,
+            CommandResult(command.commandId, "running", completedAt = null),
+        )
+        val result = try {
+            execute(command)
+        } catch (exception: Exception) {
+            CommandResult(
+                command.commandId,
+                "failed",
+                classifyFailure(exception),
+                safeFailure("Command failed", exception),
+            )
+        }
+        ledger.putCompleted(result)
+        control.submitResult(config.serverUrl, config.agentId, secret, result)
+    }
+
+    private fun execute(command: ControlCommand): CommandResult = when (command.type) {
+        "discover" -> {
+            val cameras = discovery.discover(cancelled = { !running.get() })
+            val array = JSONArray().also { target -> cameras.forEach { target.put(it.toJson()) } }
+            CommandResult(command.commandId, "succeeded", message = "Discovery completed.", data = JSONObject().put("cameras", array))
+        }
+        "camera_test" -> {
+            val (camera, password) = cameraFromPayload(command.payload)
+            RtspClient().use { it.captureOne(camera, password, cancelled = { !running.get() }) }
+            CommandResult(command.commandId, "succeeded", message = "Camera connection succeeded.", data = JSONObject().put("success", true))
+        }
+        "configure_camera" -> {
+            val (camera, password) = cameraFromPayload(command.payload)
+            RtspClient().use { it.captureOne(camera, password, cancelled = { !running.get() }) }
+            val current = configStore.load()
+            configStore.save(current.copy(camera = camera), cameraPassword = password ?: "")
+            restartCapture()
+            CommandResult(command.commandId, "succeeded", message = "Camera configuration saved; capture restarted.")
+        }
+        "set_inference_mode" -> {
+            val mode = command.payload.getString("mode")
+            if (mode != "AUTO") throw UnsupportedOperationException("Inference mode is not supported")
+            val current = configStore.load()
+            configStore.save(current.copy(requestedInferenceMode = "AUTO"))
+            CommandResult(
+                command.commandId, "succeeded", message = "Inference mode updated.",
+                data = JSONObject().put("effective_mode", "AUTO"),
+            )
+        }
+        "restart", "reconfigure" -> {
+            restartCapture()
+            CommandResult(
+                command.commandId, "succeeded", message = "Android monitoring session restarted.",
+                data = JSONObject().put("restart_requested", true),
+            )
+        }
+        else -> throw UnsupportedOperationException("Unsupported command")
+    }
+
+    private fun cameraFromPayload(payload: JSONObject): Pair<CameraConfig, String?> {
+        val camera = CameraConfig(
+            cameraId = payload.optString("camera_id", "cam-1"),
+            name = payload.optString("name", "Home camera"),
+            host = payload.getString("host"),
+            port = payload.optInt("port", 554),
+            mainPath = payload.optString("main_path", "/stream1"),
+            subPath = payload.optNullableString("sub_path")?.takeIf(String::isNotBlank),
+            username = payload.optNullableString("username")?.takeIf(String::isNotBlank),
+        )
+        camera.validate()
+        return camera to payload.optNullableString("password")
+    }
+
+    private fun safeConfig(): AgentConfig? = try {
+        configStore.load()
+    } catch (exception: Exception) {
+        publish(runtime.copy(
+            health = HealthState.DEGRADED,
+            explanation = safeFailure("Stored configuration is invalid", exception),
+        ))
+        null
+    }
+
+    private fun cameraExplanation(): String? =
+        if (runtime.cameraConnectivity == CameraConnectivity.DISCONNECTED) runtime.explanation else null
+
+    @Synchronized
+    private fun publish(status: RuntimeStatus) {
+        runtime = status
+        runCatching { statusStore.write(status) }
+        onStatus(status)
+    }
+
+    private fun interruptibleSleep(durationMs: Long) {
+        if (durationMs <= 0) return
+        try {
+            Thread.sleep(durationMs)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
+    private fun classifyFailure(exception: Exception): String = when (exception) {
+        is IllegalArgumentException, is org.json.JSONException -> "invalid_request"
+        is UnsupportedOperationException -> "unsupported"
+        is RtspAuthenticationException -> "authentication_failed"
+        is RtspException, is java.io.IOException -> "camera_unreachable"
+        else -> "execution_failed"
+    }
+
+    private fun safeFailure(prefix: String, exception: Exception): String = "$prefix (${exception::class.java.simpleName})."
+
+    companion object { private const val POLL_INTERVAL_MS = 5_000L }
+}

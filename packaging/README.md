@@ -1,4 +1,4 @@
-# Linux packaging and installation
+# Linux / Raspberry Pi packaging and installation
 
 The agent ships as one PyInstaller binary per Linux architecture. Raspberry Pi
 is the Linux ARM64 deployment profile; it does not have a separate codebase.
@@ -109,5 +109,6 @@ Repeat the help/status smoke check for ARM64 under an ARM64 runner or buildx/QEM
 then validate RTSP capture, service restart, and outage spool recovery on the
 actual target class.
 
-Android packaging and runtime behavior are outside this Linux/Raspberry Pi
-release profile.
+The native Android Agent is a separate application and release path. See
+`../android-agent/README.md`; it does not use these PyInstaller or systemd
+artifacts.
