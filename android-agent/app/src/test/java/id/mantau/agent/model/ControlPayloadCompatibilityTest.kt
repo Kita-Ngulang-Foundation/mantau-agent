@@ -30,8 +30,8 @@ class ControlPayloadCompatibilityTest {
         ))
         assertEquals(coreKeys, payload.keySet())
         assertEquals("android", payload.getString("platform"))
-        assertEquals("AUTO", payload.getString("recommended_mode"))
-        assertEquals(listOf("AUTO"), payload.getJSONArray("supported_inference_modes").toStringList())
+        assertEquals("CLOUD", payload.getString("recommended_mode"))
+        assertEquals(listOf("AUTO", "CLOUD"), payload.getJSONArray("supported_inference_modes").toStringList())
         assertEquals(0, payload.getJSONArray("supported_detector_backends").length())
     }
 

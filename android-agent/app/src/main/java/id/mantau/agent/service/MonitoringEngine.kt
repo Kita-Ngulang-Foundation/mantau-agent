@@ -1,7 +1,16 @@
 package id.mantau.agent.service
 
 import android.content.Context
+import android.os.SystemClock
 import id.mantau.agent.discovery.AndroidWsDiscovery
+import id.mantau.agent.inference.AndroidH264JpegDecoder
+import id.mantau.agent.inference.AndroidThermalStateProvider
+import id.mantau.agent.inference.CapabilityBenchmark
+import id.mantau.agent.inference.FallEventGate
+import id.mantau.agent.inference.HybridConfirmationPolicy
+import id.mantau.agent.inference.InferenceModePolicy
+import id.mantau.agent.inference.ModeSelection
+import id.mantau.agent.inference.UnavailableMobileDetector
 import id.mantau.agent.model.AgentConfig
 import id.mantau.agent.model.CameraConfig
 import id.mantau.agent.model.CameraConnectivity
@@ -19,15 +28,22 @@ import id.mantau.agent.rtsp.RtspAuthenticationException
 import id.mantau.agent.rtsp.RtspClient
 import id.mantau.agent.rtsp.RtspException
 import id.mantau.agent.rtsp.RtspState
+import id.mantau.agent.rtsp.VideoFormat
 import id.mantau.agent.storage.AgentConfigStore
 import id.mantau.agent.storage.AndroidKeystoreSecretStore
 import id.mantau.agent.storage.RuntimeStatusStore
+import id.mantau.agent.uplink.DurableUplink
+import id.mantau.agent.uplink.FrameUploadPolicy
+import id.mantau.agent.uplink.Heartbeat
+import id.mantau.agent.uplink.LatestWorkQueue
+import id.mantau.agent.uplink.SignedFrameUploader
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Instant
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 class MonitoringEngine(
     private val context: Context,
@@ -42,7 +58,35 @@ class MonitoringEngine(
     private val control = ControlPlaneClient()
     private val discovery = AndroidWsDiscovery(context)
     private val frames = LatestFrameBuffer(2)
-    private var executor = Executors.newFixedThreadPool(2)
+    private val detector = UnavailableMobileDetector()
+    private val thermal = AndroidThermalStateProvider(context)
+    private val capabilities = CapabilityBenchmark(context, thermal).run(detector)
+    @Volatile private var detectorFailure: String? = null
+    private val modePolicy = InferenceModePolicy(
+        detectorAvailable = { capabilities.detectorAvailable && detectorFailure == null },
+        detectorFailure = { detectorFailure ?: detector.availability.reason },
+        thermal = thermal,
+    )
+    @Volatile private var selection = ModeSelection("AUTO", "CLOUD", capabilities.reason)
+    private val frameQueue = LatestWorkQueue<id.mantau.agent.rtsp.EncodedFrame>(2)
+    @Volatile private var videoFormat: VideoFormat? = null
+    private val uploadPolicy = FrameUploadPolicy()
+    private val frameUploader = SignedFrameUploader(
+        serverUrl = { configStore.load().serverUrl },
+        agentId = { configStore.load().agentId },
+        secret = { requireNotNull(configStore.agentSecret()) },
+    )
+    private val durableUplink = DurableUplink(
+        serverUrl = { configStore.load().serverUrl },
+        agentId = { configStore.load().agentId },
+        secret = { requireNotNull(configStore.agentSecret()) },
+        stateDirectory = java.io.File(context.filesDir, "uplink"),
+    )
+    private val hybridPolicy = HybridConfirmationPolicy()
+    private val uploadedFrames = AtomicLong()
+    private val discardedFrames = AtomicLong()
+    private val uploadFailures = AtomicLong()
+    private var executor = Executors.newFixedThreadPool(4)
     @Volatile private var activeRtsp: RtspClient? = null
     @Volatile private var runtime = RuntimeStatus()
     private var lastPersistedFrameSecond = -1L
@@ -50,10 +94,21 @@ class MonitoringEngine(
     @Synchronized
     fun start() {
         if (!lifecycle.beginStart()) return
-        if (executor.isShutdown) executor = Executors.newFixedThreadPool(2)
+        if (executor.isShutdown) executor = Executors.newFixedThreadPool(4)
         running.set(true)
-        publish(RuntimeStatus(running = true, health = HealthState.ONLINE, rtspState = "connecting"))
+        val config = configStore.load()
+        selection = safeSelection(config.requestedInferenceMode)
+        publish(RuntimeStatus(
+            running = true,
+            health = HealthState.ONLINE,
+            rtspState = "connecting",
+            effectiveInferenceMode = selection.effective,
+            inferenceExplanation = selection.reason,
+            thermalState = thermal.current().wireName,
+        ))
         executor.submit(::captureLoop)
+        executor.submit(::inferenceLoop)
+        executor.submit(::uplinkLoop)
         executor.submit(::controlLoop)
         lifecycle.markRunning()
     }
@@ -63,6 +118,7 @@ class MonitoringEngine(
         if (!lifecycle.beginStop()) return
         running.set(false)
         activeRtsp?.close()
+        frameQueue.close()
         executor.shutdownNow()
         executor.awaitTermination(3, TimeUnit.SECONDS)
         publish(runtime.copy(
@@ -109,8 +165,13 @@ class MonitoringEngine(
                         ))
                     }
 
+                    override fun onFormat(format: VideoFormat) {
+                        videoFormat = format
+                    }
+
                     override fun onFrame(frame: id.mantau.agent.rtsp.EncodedFrame) {
                         reconnect.reset()
+                        frameQueue.offer(frame)
                         val second = frame.capturedAt.epochSecond
                         if (second != lastPersistedFrameSecond) {
                             lastPersistedFrameSecond = second
@@ -143,6 +204,107 @@ class MonitoringEngine(
         }
     }
 
+    private fun inferenceLoop() {
+        val decoder = AndroidH264JpegDecoder(uploadPolicy.maxWidth, uploadPolicy.jpegQuality)
+        var gateCameraId: String? = null
+        var eventGate: FallEventGate? = null
+        try {
+            while (running.get()) {
+                val encoded = frameQueue.take() ?: break
+                val format = videoFormat
+                if (format == null) {
+                    discardedFrames.incrementAndGet()
+                    continue
+                }
+                val mode = selection.effective
+                if (mode == "CLOUD" && !uploadPolicy.ready(SystemClock.elapsedRealtime())) {
+                    discardedFrames.incrementAndGet()
+                    continue
+                }
+                try {
+                    decoder.configure(format)
+                    val jpeg = decoder.decode(encoded) ?: continue
+                    val config = configStore.load()
+                    val camera = config.camera ?: continue
+                    if (mode == "CLOUD") {
+                        if (!uploadPolicy.admit(jpeg, SystemClock.elapsedRealtime())) {
+                            discardedFrames.incrementAndGet()
+                        } else if (frameUploader.upload(camera.cameraId, jpeg.bytes)) {
+                            uploadedFrames.incrementAndGet()
+                        } else {
+                            // Frames are deliberately disposable: never enter the event spool.
+                            uploadFailures.incrementAndGet()
+                            discardedFrames.incrementAndGet()
+                        }
+                        continue
+                    }
+
+                    if (gateCameraId != camera.cameraId) {
+                        gateCameraId = camera.cameraId
+                        eventGate = FallEventGate(camera.cameraId)
+                    }
+                    val events = detector.detect(jpeg).mapNotNull { eventGate?.accept(it, encoded.capturedAt) }
+                    for (event in events) {
+                        durableUplink.sendEvent(event)
+                        if (mode == "HYBRID" && hybridPolicy.shouldUpload(event.eventId, jpeg.capturedAtMs)) {
+                            // This branch remains unreachable until a server event-correlation contract exists.
+                            if (!frameUploader.upload(camera.cameraId, jpeg.bytes)) uploadFailures.incrementAndGet()
+                        }
+                    }
+                } catch (exception: Exception) {
+                    detectorFailure = "Detector/decoder failure (${exception::class.java.simpleName}); using CLOUD."
+                    selection = ModeSelection(selection.requested, "CLOUD", detectorFailure!!)
+                    publish(runtime.copy(
+                        effectiveInferenceMode = "CLOUD",
+                        inferenceExplanation = detectorFailure,
+                        health = HealthState.DEGRADED,
+                    ))
+                }
+            }
+        } finally {
+            decoder.close()
+            detector.close()
+        }
+    }
+
+    private fun uplinkLoop() {
+        var nextHeartbeatAt = 0L
+        while (running.get()) {
+            val config = safeConfig()
+            val secret = runCatching { configStore.agentSecret() }.getOrNull()
+            if (config != null && config.serverUrl.isNotBlank() && !secret.isNullOrBlank()) {
+                val now = SystemClock.elapsedRealtime()
+                if (now >= nextHeartbeatAt) {
+                    if (config.requestedInferenceMode == "AUTO" || selection.effective in setOf("EDGE", "HYBRID")) {
+                        selection = safeSelection(config.requestedInferenceMode)
+                    }
+                    val heartbeat = Heartbeat(
+                        agentId = config.agentId,
+                        cameraId = config.camera?.cameraId,
+                        sentAt = Instant.now(),
+                        cameraReachable = runtime.cameraConnectivity == CameraConnectivity.CONNECTED,
+                        detectorAlive = selection.effective != "CLOUD" && detectorFailure == null,
+                        queueDepth = durableUplink.depth(),
+                    )
+                    runCatching { durableUplink.sendHeartbeat(heartbeat) }
+                    nextHeartbeatAt = now + HEARTBEAT_INTERVAL_MS
+                } else {
+                    runCatching { durableUplink.drain() }
+                }
+            }
+            publish(runtime.copy(
+                effectiveInferenceMode = selection.effective,
+                inferenceExplanation = selection.reason,
+                eventQueueDepth = durableUplink.depth(),
+                uploadedFrames = uploadedFrames.get(),
+                discardedFrames = discardedFrames.get() + frameQueue.dropped,
+                uploadFailures = uploadFailures.get(),
+                thermalState = thermal.current().wireName,
+            ))
+            interruptibleSleep(UPLINK_TICK_MS)
+        }
+    }
+
     private fun controlLoop() {
         while (running.get()) {
             val config = safeConfig()
@@ -156,7 +318,10 @@ class MonitoringEngine(
                 continue
             }
             try {
-                val status = WirePayloads.status(context, config, runtime, enrolled = true)
+                val status = WirePayloads.status(
+                    config, runtime, enrolled = true,
+                    capabilities = WirePayloads.capabilities(capabilities.wireFacts()),
+                )
                 val command = control.poll(config.serverUrl, config.agentId, secret, status)
                 if (!running.get()) break
                 publish(runtime.copy(lastControlContactAt = Instant.now(), explanation = cameraExplanation()))
@@ -224,12 +389,18 @@ class MonitoringEngine(
         }
         "set_inference_mode" -> {
             val mode = command.payload.getString("mode")
-            if (mode != "AUTO") throw UnsupportedOperationException("Inference mode is not supported")
+            val selected = modePolicy.select(mode)
             val current = configStore.load()
-            configStore.save(current.copy(requestedInferenceMode = "AUTO"))
+            configStore.save(current.copy(requestedInferenceMode = mode))
+            selection = selected
+            frameQueue.clear()
+            publish(runtime.copy(
+                effectiveInferenceMode = selected.effective,
+                inferenceExplanation = selected.reason,
+            ))
             CommandResult(
                 command.commandId, "succeeded", message = "Inference mode updated.",
-                data = JSONObject().put("effective_mode", "AUTO"),
+                data = JSONObject().put("effective_mode", selected.effective).put("reason", selected.reason),
             )
         }
         "restart", "reconfigure" -> {
@@ -266,6 +437,13 @@ class MonitoringEngine(
         null
     }
 
+    private fun safeSelection(requested: String): ModeSelection = try {
+        modePolicy.select(requested)
+    } catch (exception: UnsupportedOperationException) {
+        val fallback = modePolicy.select("CLOUD")
+        fallback.copy(requested = requested, reason = "${exception.message} Falling back safely to CLOUD.")
+    }
+
     private fun cameraExplanation(): String? =
         if (runtime.cameraConnectivity == CameraConnectivity.DISCONNECTED) runtime.explanation else null
 
@@ -295,5 +473,9 @@ class MonitoringEngine(
 
     private fun safeFailure(prefix: String, exception: Exception): String = "$prefix (${exception::class.java.simpleName})."
 
-    companion object { private const val POLL_INTERVAL_MS = 5_000L }
+    companion object {
+        private const val POLL_INTERVAL_MS = 5_000L
+        private const val HEARTBEAT_INTERVAL_MS = 30_000L
+        private const val UPLINK_TICK_MS = 2_000L
+    }
 }

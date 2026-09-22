@@ -17,6 +17,13 @@ data class RuntimeStatus(
     val explanation: String? = null,
     val rtspState: String = "stopped",
     val reconnectCount: Int = 0,
+    val effectiveInferenceMode: String = "CLOUD",
+    val inferenceExplanation: String? = null,
+    val eventQueueDepth: Int = 0,
+    val uploadedFrames: Long = 0,
+    val discardedFrames: Long = 0,
+    val uploadFailures: Long = 0,
+    val thermalState: String = "unavailable",
 )
 
 data class ControlCommand(
@@ -103,6 +110,11 @@ object WirePayloads {
         val cpu: String,
         val memoryBytes: Long,
         val softwareVersion: String,
+        val availableAccelerators: List<String> = emptyList(),
+        val supportedDetectorBackends: List<String> = emptyList(),
+        val recommendedMode: String = "CLOUD",
+        val supportedInferenceModes: List<String> = listOf("AUTO", "CLOUD"),
+        val recommendationReason: String = "Capability benchmark completed.",
     )
 
     fun capabilities(context: Context): JSONObject {
@@ -113,6 +125,7 @@ object WirePayloads {
             cpu = Build.HARDWARE.ifBlank { Build.BOARD },
             memoryBytes = memory,
             softwareVersion = BuildConfig.VERSION_NAME,
+            recommendationReason = "Capability benchmark has not completed.",
         ))
     }
 
@@ -123,12 +136,12 @@ object WirePayloads {
             .put("architecture", facts.architecture)
             .put("cpu", facts.cpu)
             .put("memory_bytes", facts.memoryBytes)
-            .put("available_accelerators", JSONArray())
-            .put("supported_detector_backends", JSONArray())
+            .put("available_accelerators", JSONArray(facts.availableAccelerators))
+            .put("supported_detector_backends", JSONArray(facts.supportedDetectorBackends))
             .put("software_version", facts.softwareVersion)
-            .put("recommended_mode", "AUTO")
-            .put("supported_inference_modes", JSONArray().put("AUTO"))
-            .put("recommendation_reason", "This release captures CCTV locally; inference is not included.")
+            .put("recommended_mode", facts.recommendedMode)
+            .put("supported_inference_modes", JSONArray(facts.supportedInferenceModes))
+            .put("recommendation_reason", facts.recommendationReason)
     }
 
     fun status(context: Context, config: AgentConfig, runtime: RuntimeStatus, enrolled: Boolean): JSONObject =
@@ -148,13 +161,13 @@ object WirePayloads {
                 else -> "configuring_camera"
             })
             .put("health_state", runtime.health.wireValue)
-            .put("requested_inference_mode", "AUTO")
-            .put("effective_inference_mode", "AUTO")
+            .put("requested_inference_mode", config.requestedInferenceMode)
+            .put("effective_inference_mode", runtime.effectiveInferenceMode)
             .put("capabilities", capabilities)
             .put("camera_connectivity", runtime.cameraConnectivity.wireValue)
             .put("last_heartbeat_at", runtime.lastControlContactAt?.toString() ?: JSONObject.NULL)
             .put("last_frame_at", runtime.lastFrameAt?.toString() ?: JSONObject.NULL)
-            .put("health_explanation", runtime.explanation ?: JSONObject.NULL)
+            .put("health_explanation", (runtime.explanation ?: runtime.inferenceExplanation) ?: JSONObject.NULL)
 }
 
 fun JSONObject.optNullableString(name: String): String? =

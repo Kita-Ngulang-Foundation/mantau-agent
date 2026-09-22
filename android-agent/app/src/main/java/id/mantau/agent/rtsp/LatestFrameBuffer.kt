@@ -5,6 +5,13 @@ import java.util.ArrayDeque
 
 data class EncodedFrame(val bytes: ByteArray, val capturedAt: Instant, val rtpTimestamp: Long)
 
+data class VideoFormat(
+    val width: Int,
+    val height: Int,
+    val sps: ByteArray? = null,
+    val pps: ByteArray? = null,
+)
+
 class LatestFrameBuffer(val capacity: Int = 2) {
     private val frames = ArrayDeque<EncodedFrame>()
 
@@ -30,4 +37,3 @@ class LatestFrameBuffer(val capacity: Int = 2) {
     @get:Synchronized
     val size: Int get() = frames.size
 }
-

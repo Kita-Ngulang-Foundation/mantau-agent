@@ -53,8 +53,13 @@ class MainActivity : Activity() {
                 status.text = buildString {
                     append(if (current.running) "Service running" else "Service stopped")
                     append("\nCamera: ${current.cameraConnectivity.wireValue} (${current.rtspState})")
+                    append("\nInference: ${current.effectiveInferenceMode} · thermal ${current.thermalState}")
+                    current.inferenceExplanation?.let { append("\n$it") }
                     current.lastFrameAt?.let { append("\nLast frame: $it") }
                     current.lastControlContactAt?.let { append("\nControl plane: $it") }
+                    append("\nFrames uploaded/discarded: ${current.uploadedFrames}/${current.discardedFrames}")
+                    append(" · failures ${current.uploadFailures}")
+                    append("\nDurable event queue: ${current.eventQueueDepth}")
                     if (current.reconnectCount > 0) append("\nReconnects: ${current.reconnectCount}")
                     current.explanation?.let { append("\n$it") }
                 }

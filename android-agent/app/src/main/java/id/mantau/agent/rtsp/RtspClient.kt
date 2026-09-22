@@ -1,5 +1,6 @@
 package id.mantau.agent.rtsp
 
+import id.mantau.agent.BuildConfig
 import id.mantau.agent.model.CameraConfig
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
@@ -49,10 +50,11 @@ class RtspClient(private val connectTimeoutMs: Int = 5_000) : AutoCloseable {
             val describe = connection.requestAuthenticated(
                 "DESCRIBE", streamUrl, mapOf("Accept" to "application/sdp"),
             )
-            val trackUrl = selectH264Track(describe.body, describe.headers["content-base"] ?: streamUrl)
+            val selectedTrack = selectH264Track(describe.body, describe.headers["content-base"] ?: streamUrl)
+            listener.onFormat(selectedTrack.format)
             val setup = connection.requestAuthenticated(
                 "SETUP",
-                trackUrl,
+                selectedTrack.url,
                 mapOf("Transport" to "RTP/AVP/TCP;unicast;interleaved=0-1"),
             )
             connection.session = setup.headers["session"]?.substringBefore(';')?.trim()
@@ -122,26 +124,51 @@ class RtspClient(private val connectTimeoutMs: Int = 5_000) : AutoCloseable {
         }
     }
 
-    private fun selectH264Track(sdp: ByteArray, baseUrl: String): String {
+    private data class SelectedTrack(val url: String, val format: VideoFormat)
+
+    private fun selectH264Track(sdp: ByteArray, baseUrl: String): SelectedTrack {
         val lines = sdp.toString(Charsets.UTF_8).lines().map(String::trim)
         var video = false
         var h264 = false
         var control: String? = null
-        fun selected(): String? = if (video && h264 && !control.isNullOrBlank()) resolveControl(baseUrl, control!!) else null
+        var width = 640
+        var height = 480
+        var sps: ByteArray? = null
+        var pps: ByteArray? = null
+        fun selected(): SelectedTrack? = if (video && h264 && !control.isNullOrBlank()) {
+            SelectedTrack(resolveControl(baseUrl, control!!), VideoFormat(width, height, sps, pps))
+        } else null
         for (line in lines + "m=end") {
             if (line.startsWith("m=")) {
                 selected()?.let { return it }
                 video = line.startsWith("m=video")
                 h264 = false
                 control = null
+                width = 640
+                height = 480
+                sps = null
+                pps = null
             } else if (video && line.startsWith("a=rtpmap:") && line.contains("H264", ignoreCase = true)) {
                 h264 = true
             } else if (video && line.startsWith("a=control:")) {
                 control = line.substringAfter("a=control:").trim()
+            } else if (video && line.startsWith("a=framesize:")) {
+                Regex("(\\d+)[-x](\\d+)").find(line.substringAfter(' '))?.let {
+                    width = it.groupValues[1].toInt()
+                    height = it.groupValues[2].toInt()
+                }
+            } else if (video && line.startsWith("a=fmtp:") && "sprop-parameter-sets=" in line) {
+                val encoded = line.substringAfter("sprop-parameter-sets=").substringBefore(';').split(',')
+                sps = encoded.getOrNull(0)?.let(::decodeCodecData)
+                pps = encoded.getOrNull(1)?.let(::decodeCodecData)
             }
         }
         throw RtspException("Camera SDP has no supported H.264 video track")
     }
+
+    private fun decodeCodecData(value: String): ByteArray? = runCatching {
+        byteArrayOf(0, 0, 0, 1) + Base64.getDecoder().decode(value.trim())
+    }.getOrNull()
 
     private fun resolveControl(base: String, control: String): String {
         if (control.startsWith("rtsp://", ignoreCase = true)) return control
@@ -152,6 +179,7 @@ class RtspClient(private val connectTimeoutMs: Int = 5_000) : AutoCloseable {
 
     interface Listener {
         fun onState(state: RtspState) {}
+        fun onFormat(format: VideoFormat) {}
         fun onFrame(frame: EncodedFrame) {}
 
         companion object { val NONE = object : Listener {} }
@@ -188,7 +216,7 @@ class RtspClient(private val connectTimeoutMs: Int = 5_000) : AutoCloseable {
         private fun request(method: String, url: String, headers: Map<String, String>): Response {
             val requestHeaders = linkedMapOf(
                 "CSeq" to sequence++.toString(),
-                "User-Agent" to "Mantau-Android-Agent/0.1",
+                "User-Agent" to "Mantau-Android-Agent/${BuildConfig.VERSION_NAME}",
             )
             session?.let { requestHeaders["Session"] = it }
             auth?.header(method, url)?.let { requestHeaders["Authorization"] = it }

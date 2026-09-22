@@ -32,8 +32,11 @@ ONVIF/manual setup -> RTSP validation -> durable config
 The Linux/Pi implementation reuses the existing `CameraPuller`, `FrameSampler`, core
 detector protocol and adapters, `FrameUplink`, signed envelopes, sequence
 counter, SQLite spool, and heartbeat contract. The Android implementation uses
-the same v1 control payloads but intentionally has no inference or cloud-frame
-upload in this release.
+the same v1 control payloads, signed live-frame protocol, envelope signatures,
+and golden fixtures. Its bounded CLOUD mode is available now. EDGE and HYBRID
+remain unavailable until a licensed detector artifact and an event-correlated
+server confirmation contract are supplied; AUTO therefore selects CLOUD and
+reports the reason.
 
 ## Linux / Raspberry Pi installation
 

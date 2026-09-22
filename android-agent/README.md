@@ -12,11 +12,33 @@ The Android agent uses the existing v1 control contracts and endpoints:
 - durable command results: `POST /agent-control/commands/{id}/results`;
 - `platform` is always `android` in status and capability reports.
 
-This release intentionally does not perform edge inference or cloud-frame
-upload. Its capability report advertises no detector backend and only `AUTO` as
-a supported inference mode. `EDGE`, `CLOUD`, and `HYBRID` commands fail with the
-shared `unsupported` command reason instead of claiming behavior that is not
-present.
+The agent benchmarks architecture, memory, Android GPU/NNAPI API availability,
+detector availability/latency, and thermal state. It maps those facts into the
+existing v1 capability fields and reports the selected mode and explanation in
+the existing status/health fields. It does not add Android-only wire fields.
+
+`AUTO` and `CLOUD` are currently advertised. CLOUD decodes the RTSP H.264
+substream locally and sends signed sampled JPEGs through the existing
+`POST /cameras/{camera_id}/frame` protocol. Defaults are bounded to 1 FPS, 640
+pixels wide, JPEG quality 65, and 256 KiB per frame (with a hard 2 FPS ceiling).
+The work queue keeps at most two latest frames. Frames that exceed limits, age
+out, or encounter an outage are explicitly discarded; live frames are never
+spooled for later upload.
+
+EDGE is implemented behind an interchangeable detector interface, including
+event cooldown/deduplication and exact Linux/Pi fall-event mapping, but is not
+advertised or selectable because this repository contains no verified,
+redistributable mobile fall-detection model. Enabling it requires a
+`fall_detection.tflite` artifact plus its source URL, SPDX license, SHA-256,
+input tensor specification, and documented fall-output semantics. The
+unavailable detector never fabricates a fall.
+
+HYBRID has a bounded one-confirmation-frame-per-event policy with a five-second
+minimum interval, but remains unavailable because there is also no
+event-correlated server-confirmation endpoint in the shared contract. It never
+uses continuous full-quality video. Unsupported EDGE/HYBRID commands return
+the shared `unsupported` result. AUTO falls back to CLOUD for missing/failed
+detectors or thermal pressure and reports a precise explanation.
 
 ## Build
 
@@ -92,6 +114,16 @@ a development server on the home LAN can be used.
 - A delivered command is encrypted and persisted before the agent submits its
   `running` result. Final results are persisted before submission and replayed
   on redelivery, matching the Linux/Pi custody and idempotency behavior.
+- Heartbeats and semantic events use the same canonical HMAC envelope as the
+  Python agent. Sequence allocation is persisted before use. A bounded,
+  app-private, fsynced queue retains unacknowledged envelopes across restarts;
+  acknowledgements remove them atomically, so a recovered event keeps its
+  original sequence and signature and server-side deduplication prevents a
+  duplicate delivery.
+- Inference-mode commands update the requested mode durably. The effective mode
+  is re-evaluated against detector health and thermal pressure, and status
+  reports requested mode, effective mode, reason, queue depth, and disposable
+  frame-upload counters without exposing credentials.
 
 Stopping the service releases the RTSP socket and wake lock and removes the
 foreground notification. Android app-data removal intentionally erases the
@@ -100,8 +132,11 @@ identity and Keystore-protected secrets; the device must then be re-enrolled.
 ## Tests
 
 `testDebugUnitTest` covers configuration validation, exact shared-fixture field
-compatibility, service lifecycle state, multicast-lock cleanup, multi-camera
-discovery parsing/deduplication, RTSP state transitions, latest-frame queue
-bounds/copying, and reconnect backoff/reset behavior. Real ONVIF cameras,
-vendor RTSP authentication variants, device power management, and control-plane
-integration still require hardware testing on the target phone and LAN.
+compatibility, exact Python-agent golden envelope/signature compatibility,
+service lifecycle state, multicast-lock cleanup, multi-camera discovery
+parsing/deduplication, RTSP state transitions, latest-frame and upload queue
+bounds, reconnect behavior, signed frame requests, disposable outage behavior,
+durable queue recovery, cooldown/deduplication, detector and thermal fallback,
+and inference-mode transitions. Real ONVIF cameras, MediaCodec/vendor RTSP
+variants, device power management, and control-plane integration still require
+hardware testing on the target phone and LAN.

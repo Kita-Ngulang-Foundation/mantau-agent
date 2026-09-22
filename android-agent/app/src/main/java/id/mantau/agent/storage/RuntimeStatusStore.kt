@@ -19,6 +19,13 @@ class RuntimeStatusStore(context: Context) {
         explanation = preferences.getString("explanation", null),
         rtspState = preferences.getString("rtsp_state", "stopped") ?: "stopped",
         reconnectCount = preferences.getInt("reconnect_count", 0),
+        effectiveInferenceMode = preferences.getString("effective_mode", "CLOUD") ?: "CLOUD",
+        inferenceExplanation = preferences.getString("inference_explanation", null),
+        eventQueueDepth = preferences.getInt("event_queue_depth", 0),
+        uploadedFrames = preferences.getLong("uploaded_frames", 0),
+        discardedFrames = preferences.getLong("discarded_frames", 0),
+        uploadFailures = preferences.getLong("upload_failures", 0),
+        thermalState = preferences.getString("thermal_state", "unavailable") ?: "unavailable",
     )
 
     @Synchronized
@@ -32,6 +39,13 @@ class RuntimeStatusStore(context: Context) {
             .putString("explanation", status.explanation)
             .putString("rtsp_state", status.rtspState)
             .putInt("reconnect_count", status.reconnectCount)
+            .putString("effective_mode", status.effectiveInferenceMode)
+            .putString("inference_explanation", status.inferenceExplanation)
+            .putInt("event_queue_depth", status.eventQueueDepth)
+            .putLong("uploaded_frames", status.uploadedFrames)
+            .putLong("discarded_frames", status.discardedFrames)
+            .putLong("upload_failures", status.uploadFailures)
+            .putString("thermal_state", status.thermalState)
             .commit()) { "Could not persist runtime status" }
     }
 

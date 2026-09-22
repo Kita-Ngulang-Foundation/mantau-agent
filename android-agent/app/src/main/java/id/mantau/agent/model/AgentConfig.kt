@@ -41,12 +41,12 @@ data class AgentConfig(
                 "Server URL must be an http(s) URL"
             }
         }
-        require(requestedInferenceMode == "AUTO") {
-            "This Android build supports AUTO only; inference is not included"
-        }
+        require(requestedInferenceMode in INFERENCE_MODES) { "Unknown inference mode" }
         if (requireCamera) requireNotNull(camera) { "Camera configuration is required" }
         camera?.validate()
     }
+
+    companion object { val INFERENCE_MODES = setOf("AUTO", "EDGE", "CLOUD", "HYBRID") }
 }
 
 data class Enrollment(val agentId: String, val secret: String, val claimCode: String?)
@@ -58,4 +58,3 @@ enum class CameraConnectivity(val wireValue: String) {
 enum class HealthState(val wireValue: String) {
     ONLINE("online"), DEGRADED("degraded"), STOPPED("stopped")
 }
-

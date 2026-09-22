@@ -29,9 +29,10 @@ class AgentConfigTest {
     }
 
     @Test
-    fun `nonexistent inference modes are rejected`() {
+    fun `shared inference modes are accepted and unknown modes are rejected`() {
+        AgentConfig(agentId = "agent-1", requestedInferenceMode = "EDGE").validate()
         assertThrows(IllegalArgumentException::class.java) {
-            AgentConfig(agentId = "agent-1", requestedInferenceMode = "EDGE").validate()
+            AgentConfig(agentId = "agent-1", requestedInferenceMode = "MAGIC").validate()
         }
     }
 }

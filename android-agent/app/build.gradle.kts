@@ -11,8 +11,8 @@ android {
         applicationId = "id.mantau.agent"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
 
         testInstrumentationRunner = "android.app.Instrumentation"
     }
@@ -51,5 +51,9 @@ tasks.withType<Test>().configureEach {
     systemProperty(
         "mantau.contract.fixtures",
         rootProject.file("../../mantau-core/src/mantau_core/contracts/fixtures/v1").absolutePath,
+    )
+    systemProperty(
+        "mantau.protocol.examples",
+        rootProject.file("../../protocol/examples").absolutePath,
     )
 }
