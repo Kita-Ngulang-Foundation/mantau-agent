@@ -33,10 +33,13 @@ The Linux/Pi implementation reuses the existing `CameraPuller`, `FrameSampler`, 
 detector protocol and adapters, `FrameUplink`, signed envelopes, sequence
 counter, SQLite spool, and heartbeat contract. The Android implementation uses
 the same v1 control payloads, signed live-frame protocol, envelope signatures,
-and golden fixtures. Its bounded CLOUD mode is available now. EDGE and HYBRID
-remain unavailable until a licensed detector artifact and an event-correlated
-server confirmation contract are supplied; AUTO therefore selects CLOUD and
-reports the reason.
+and golden fixtures. Both agents detect falls on device (EDGE): the Python agent
+through `mantau_core.detection.MediapipeDetector`, the Android agent through
+MediaPipe Tasks Pose Landmarker plus a Kotlin port of the same fall rules and the
+same ONNX classifier. Model files are SHA-256 verified against mantau-core's
+pinned manifest before loading, and shared pose-sequence fixtures hold both ports
+to identical fall decisions. CLOUD and HYBRID stay unavailable (no server
+inference endpoint exists) and are never advertised as supported.
 
 ## Linux / Raspberry Pi installation
 
@@ -195,8 +198,10 @@ The principal runtime variables are:
 | `MANTAU_CAMERA_MAIN_PATH`, `MANTAU_CAMERA_SUB_PATH` | `/stream1`, unset | RTSP profiles |
 | `MANTAU_DEFAULT_STREAM_PROFILE` | `sub` | Preferred profile; core falls back to main if no sub path exists |
 | `MANTAU_INFERENCE_MODE` | `AUTO` | Requested mode |
-| `MANTAU_DETECTOR_BACKEND` | `null` | `null` or `mediapipe` |
-| `MANTAU_DETECTION_FPS` | `5` | Local sample cap and AUTO throughput target |
+| `MANTAU_DETECTOR_BACKEND` | `null` | `null` or `mediapipe` (real fall detection; needs `mantau-core[detection]`) |
+| `MANTAU_MODEL_DIR` | packaged | Directory with the pinned model files; each is SHA-256 verified before loading |
+| `MANTAU_FALL_CLASSIFIER_ENABLED` | `true` | Learned confirmation layer on top of the fall rules |
+| `MANTAU_DETECTION_FPS` | `15` | Local sample cap and AUTO throughput target (below ~15 fps the fall tracker loses people mid-fall) |
 | `MANTAU_CLOUD_UPLOAD_FPS` | `1` | Cloud sample/attempt cap |
 | `MANTAU_HYBRID_CONFIRMATION_FPS` | `0.2` | HYBRID confirmation cap |
 | `MANTAU_LIVE_VIEW_FPS` | `4` | Independent live-view rate |
@@ -242,7 +247,11 @@ history and additive tables without affecting the old agent.
 | `EDGE` | Run the local detector and send real events only. |
 | `CLOUD` | Upload sampled frames through `InferenceUplink`; skip local detection. |
 | `HYBRID` | Send local events immediately and submit explicitly rate-limited event frames for server confirmation. |
-| `AUTO` | Select EDGE only when a production detector initializes, measures at the requested rate, and memory is at least 512 MiB; otherwise select CLOUD with a reason. |
+| `AUTO` | Select EDGE when a production detector initializes and its benchmark (real pose + rules + classifier on a frame with a person) succeeds. If throughput or memory is below budget, CLOUD is chosen only when a cloud transport exists; otherwise EDGE still runs, with the reason. |
+
+Capability reports list only modes that can run: EDGE when the detector loaded and
+benchmarked, CLOUD only with an injected cloud transport, HYBRID only with both.
+With neither, the recommended mode is `AUTO` and the reason says why.
 
 `NullDetector` remains compatible for wiring tests, but the production router
 suppresses all its output and any event marked `signals.synthetic`. Synthetic

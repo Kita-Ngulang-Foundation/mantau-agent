@@ -26,3 +26,7 @@ Thumbs.db
 
 # CI checkout of mantau-core
 .deps/
+
+# Instrumentation-test frames (third-party footage, generated locally by
+# android-agent/scripts/prepare-instrumentation-frames.sh)
+android-agent/app/src/androidTest/assets/frames/

@@ -119,11 +119,8 @@ class CommandExecutor:
                 "supported_detector_backends": caps.get("supported_detector_backends", []),
                 "software_version": caps["software_version"],
                 "recommended_mode": caps["recommended_mode"],
-                "supported_inference_modes": ([mode.value for mode in InferenceMode]
-                    if caps.get("detector_backend") not in (None, "null")
-                    and caps.get("detector_backend") in caps.get("supported_detector_backends", [])
-                    else ["AUTO", "CLOUD"]),
-                "recommendation_reason": caps.get("detector_error"),
+                "supported_inference_modes": caps.get("supported_inference_modes", ["AUTO"]),
+                "recommendation_reason": caps.get("recommendation_reason"),
             },
             "setup_status": "active" if self.settings.camera_host else "not_started",
             "health_state": "degraded" if (health["routing"].get("degraded") or not health["camera"]["connected"]) else "online",

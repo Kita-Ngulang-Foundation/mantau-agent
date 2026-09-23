@@ -1,2 +1,4 @@
 *.sh text eol=lf
 *.service text eol=lf
+android-agent/app/src/main/assets/mantau/* binary
+android-agent/scripts/*.sh text eol=lf

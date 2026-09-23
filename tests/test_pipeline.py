@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sys
 
 import httpx
 import numpy as np
@@ -110,7 +111,9 @@ async def test_failed_start_cleans_up_every_component(pipeline_factory):
     await pipeline.shutdown()
 
 
-async def test_auto_missing_mediapipe_degrades_without_creating_synthetic_detector(pipeline_factory):
+async def test_auto_missing_mediapipe_degrades_without_creating_synthetic_detector(
+        pipeline_factory, monkeypatch):
+    monkeypatch.setitem(sys.modules, "mantau.api.streaming", None)
     pipeline, _ = await pipeline_factory(detector_backend="mediapipe", inference_mode=Mode.AUTO)
     assert pipeline.router.mode == Mode.CLOUD
     assert pipeline.router.detector is None

@@ -25,20 +25,24 @@ The work queue keeps at most two latest frames. Frames that exceed limits, age
 out, or encounter an outage are explicitly discarded; live frames are never
 spooled for later upload.
 
-EDGE is implemented behind an interchangeable detector interface, including
-event cooldown/deduplication and exact Linux/Pi fall-event mapping, but is not
-advertised or selectable because this repository contains no verified,
-redistributable mobile fall-detection model. Enabling it requires a
-`fall_detection.tflite` artifact plus its source URL, SPDX license, SHA-256,
-input tensor specification, and documented fall-output semantics. The
-unavailable detector never fabricates a fall.
+EDGE runs on the phone (`inference/fall/`): MediaPipe Tasks Pose Landmarker
+(`pose_landmarker_lite.task`, Apache-2.0), a Kotlin port of mantau-AI's fall
+rules (tracker, fall state machine, window features), and the same
+`fall_classifier.onnx` the Python agent runs, through ONNX Runtime for Android.
+The bundled files in `app/src/main/assets/mantau/` are checked against
+mantau-core's pinned manifest (size + SHA-256) before loading; if any check or
+runtime load fails, EDGE is not advertised and the reason is reported. Events
+carry the same fields and signal names as the Python agent's and pass through
+the existing cooldown/deduplication gate. Unlike the Python agent there is no
+motion gate: pose runs on every frame the inference loop takes.
 
 HYBRID has a bounded one-confirmation-frame-per-event policy with a five-second
 minimum interval, but remains unavailable because there is also no
 event-correlated server-confirmation endpoint in the shared contract. It never
 uses continuous full-quality video. Unsupported EDGE/HYBRID commands return
-the shared `unsupported` result. AUTO falls back to CLOUD for missing/failed
-detectors or thermal pressure and reports a precise explanation.
+the shared `unsupported` result. AUTO selects EDGE when the detector loaded and
+benchmarked; it falls back to CLOUD for missing/failed detectors or thermal
+pressure and reports a precise explanation.
 
 ## Build
 
@@ -145,6 +149,14 @@ service lifecycle state, multicast-lock cleanup, multi-camera discovery
 parsing/deduplication, RTSP state transitions, latest-frame and upload queue
 bounds, reconnect behavior, signed frame requests, disposable outage behavior,
 durable queue recovery, cooldown/deduplication, detector and thermal fallback,
-and inference-mode transitions. Real ONVIF cameras, MediaCodec/vendor RTSP
+and inference-mode transitions. `FallParityTest` replays mantau-core's recorded
+pose sequences (copied into `src/test/resources/pose_sequences`) through the
+Kotlin rules and the real ONNX model and requires the exact per-frame decisions
+the Python rules recorded; `ModelAssetsTest` checks the bundled models and
+fixture copies against mantau-core.
+
+`connectedDebugAndroidTest` runs the real MediaPipe + ONNX Runtime path on a
+device or emulator. Generate its frames first with
+`scripts/prepare-instrumentation-frames.sh` (third-party footage, not committed). Real ONVIF cameras, MediaCodec/vendor RTSP
 variants, device power management, and control-plane integration still require
 hardware testing on the target phone and LAN.

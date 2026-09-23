@@ -53,7 +53,9 @@ def _build_camera(settings: Settings) -> CameraRef:
 def _build_detector(settings: Settings) -> Detector:
     if settings.detector_backend == "mediapipe":
         from mantau_core.detection.mediapipe_adapter import MediapipeDetector
-        return MediapipeDetector(settings.camera_id, config={})
+        config = {"fall": {"classifier": {"enabled": settings.fall_classifier_enabled}}}
+        return MediapipeDetector(settings.camera_id, config=config,
+                                 model_dir=settings.model_dir or None)
     if settings.detector_backend != "null":
         raise ValueError(f"Unknown detector backend: {settings.detector_backend}")
     return NullDetector(settings.camera_id, trigger_every_n_frames=settings.null_detector_trigger_every)
@@ -88,7 +90,7 @@ async def _discover_camera(settings: Settings) -> CameraRef:
     return camera
 
 
-def _probe_capabilities(settings: Settings):
+def _probe_capabilities(settings: Settings, *, cloud_available: bool = False):
     probe = None
     error = None
     try:
@@ -99,9 +101,16 @@ def _probe_capabilities(settings: Settings):
                 if settings.inference_mode != InferenceMode.AUTO:
                     raise  # Preserve MediaPipe's actionable construction error.
                 error = "Configured detector unavailable; install mantau-core[detection] streaming adapter"
+            except (RuntimeError, OSError, ValueError) as exc:
+                # Missing/tampered model files or a runtime that will not load.
+                # Only the type and our own message cross this boundary.
+                if settings.inference_mode != InferenceMode.AUTO:
+                    raise
+                error = f"Configured detector failed to load ({type(exc).__name__})"
         return inspect_capabilities(
             detector_backend=settings.detector_backend, detector=probe,
             detector_error=error, detection_fps=settings.detection_fps,
+            cloud_available=cloud_available,
         )
     finally:
         if probe is not None:
@@ -123,7 +132,8 @@ async def build_pipeline(settings: Settings, *,
         )
 
     camera = await _discover_camera(settings)
-    capabilities = await asyncio.to_thread(_probe_capabilities, settings)
+    capabilities = await asyncio.to_thread(
+        _probe_capabilities, settings, cloud_available=inference_uplink is not None)
     async with AsyncExitStack() as cleanup:
         detector = None
         if (settings.inference_mode != InferenceMode.CLOUD

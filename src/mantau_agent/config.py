@@ -46,8 +46,14 @@ class Settings(CoreSettings):
 
     # -- detection -------------------------------------------------------------
     detector_backend: str = "null"       # "null" | "mediapipe"
+    # Directory holding the pinned model files (see mantau_core.detection.
+    # artifacts); empty = the models packaged with the installed mantau-AI.
+    model_dir: str = ""
+    fall_classifier_enabled: bool = True
     inference_mode: InferenceMode = InferenceMode.AUTO
-    detection_fps: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+    # 15 fps matched full-frame-rate accuracy on the UR Fall and Y-B-Class clips;
+    # at 5-10 fps the tracker loses the person mid-fall and recall drops.
+    detection_fps: float = Field(default=15.0, gt=0, allow_inf_nan=False)
     cloud_upload_fps: float = Field(default=1.0, gt=0, le=2.0, allow_inf_nan=False)
     hybrid_confirmation_fps: float = Field(default=0.2, gt=0, allow_inf_nan=False)
     frame_queue_size: int = Field(default=2, ge=1)

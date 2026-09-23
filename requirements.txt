@@ -4,6 +4,9 @@
 # has a remote and tests are green there, switch this to the pinned git SHA
 # documented in mantau-core's own README.
 -e ../mantau-core
+# On-device fall detection (MediaPipe pose, fall rules, ONNX classifier) --
+# what MANTAU_DETECTOR_BACKEND=mediapipe runs, through mantau-core's adapter.
+-e ../mantau-AI
 
 -e .
 

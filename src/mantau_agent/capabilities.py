@@ -14,7 +14,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 class PlatformType(str, Enum):
@@ -49,7 +49,31 @@ class CapabilityReport(BaseModel):
     detector_backend: str = "null"
     detector_fps: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     detector_error: str | None = None
+    # CLOUD inference exists only when a cloud inference transport is wired in;
+    # none ships yet, so every real agent reports False.
+    cloud_available: bool = False
     recommended_mode: InferenceMode = InferenceMode.CLOUD
+    recommendation_reason: str | None = None
+
+    @property
+    def detector_usable(self) -> bool:
+        return (self.detector_backend != "null"
+                and self.detector_backend in self.supported_detector_backends
+                and not self.detector_error)
+
+    @computed_field
+    @property
+    def supported_inference_modes(self) -> list[InferenceMode]:
+        """Modes that can actually run here: EDGE needs a detector that loaded
+        and ran; CLOUD needs a cloud transport; HYBRID needs both."""
+        modes = [InferenceMode.AUTO]
+        if self.detector_usable:
+            modes.append(InferenceMode.EDGE)
+        if self.cloud_available:
+            modes.append(InferenceMode.CLOUD)
+        if self.detector_usable and self.cloud_available:
+            modes.append(InferenceMode.HYBRID)
+        return modes
 
 
 def classify_platform(system: str, architecture: str, *, model: str = "",
@@ -71,17 +95,21 @@ def select_inference_mode(requested: InferenceMode, report: CapabilityReport,
     requested = InferenceMode(requested)
     if requested != InferenceMode.AUTO:
         return ModeSelection(mode=requested, reason="Explicit operator selection")
-    if (report.detector_backend == "null"
-            or report.detector_backend not in report.supported_detector_backends
-            or report.detector_error):
+    if not report.detector_usable:
+        suffix = "" if report.cloud_available else "; cloud inference is unavailable"
         return ModeSelection(mode=InferenceMode.CLOUD,
-                             reason="No usable production detector; null is synthetic only")
+                             reason="No usable production detector; null is synthetic only" + suffix)
+    constrained = None
     if report.memory_bytes is None or report.memory_bytes < 512 * 1024**2:
-        return ModeSelection(mode=InferenceMode.CLOUD,
-                             reason="Memory unknown or below 512 MiB local-inference budget")
-    if report.detector_fps is None or report.detector_fps < detection_fps:
-        return ModeSelection(mode=InferenceMode.CLOUD,
-                             reason="Measured detector throughput unknown or below requested rate")
+        constrained = "Memory unknown or below 512 MiB local-inference budget"
+    elif report.detector_fps is None or report.detector_fps < detection_fps:
+        constrained = "Measured detector throughput unknown or below requested rate"
+    if constrained:
+        if report.cloud_available:
+            return ModeSelection(mode=InferenceMode.CLOUD, reason=constrained)
+        # A slower local detector still detects falls; nothing else can.
+        return ModeSelection(mode=InferenceMode.EDGE,
+                             reason=constrained + "; cloud inference is unavailable, so EDGE")
     return ModeSelection(mode=InferenceMode.EDGE,
                          reason="Production detector measured at or above requested rate with sufficient memory")
 
@@ -102,23 +130,32 @@ def _memory_bytes() -> int | None:
 
 def inspect_capabilities(*, detector_backend: str = "null", detector=None,
                          detector_error: str | None = None,
-                         detection_fps: float = 5.0) -> CapabilityReport:
+                         detection_fps: float = 5.0,
+                         cloud_available: bool = False) -> CapabilityReport:
     """Probe host and optionally benchmark a disposable, initialized detector.
 
-    Caller owns/ closes the probe detector; its outputs are discarded. The small
-    320x240 blank-frame benchmark is a startup estimate, not an accuracy claim.
-    Accelerators are reported only when OpenCV confirms a usable CUDA device.
+    Caller owns/ closes the probe detector; its outputs are discarded. A
+    detector with `benchmark()` measures its real inference path (models loaded
+    and run on a frame with a person); otherwise a small 320x240 blank-frame
+    estimate is used. Either way it is a throughput figure, not an accuracy
+    claim. Accelerators are reported only when OpenCV confirms a usable CUDA
+    device.
     """
     measured_fps = None
     supported = ["null"]
     if detector is not None and detector_backend != "null":
         try:
-            frame = np.zeros((240, 320, 3), dtype=np.uint8)
-            detector.push(frame, 0)  # warm up, never uplink probe outputs
-            start = time.perf_counter()
-            for ts in (200, 400, 600):
-                detector.push(frame, ts)
-            measured_fps = 3 / max(time.perf_counter() - start, 1e-9)
+            if hasattr(detector, "benchmark"):
+                measured_fps = float(detector.benchmark())
+            else:
+                frame = np.zeros((240, 320, 3), dtype=np.uint8)
+                detector.push(frame, 0)  # warm up, never uplink probe outputs
+                start = time.perf_counter()
+                for ts in (200, 400, 600):
+                    detector.push(frame, ts)
+                measured_fps = 3 / max(time.perf_counter() - start, 1e-9)
+            if not measured_fps > 0:
+                raise RuntimeError("benchmark measured no throughput")
             supported.append(detector_backend)
         except Exception as exc:
             detector_error = f"Detector probe failed: {type(exc).__name__}"
@@ -143,7 +180,13 @@ def inspect_capabilities(*, detector_backend: str = "null", detector=None,
         available_accelerators=accelerators, supported_detector_backends=supported,
         software_version=software_version, detector_backend=detector_backend,
         detector_fps=measured_fps, detector_error=detector_error,
+        cloud_available=cloud_available,
     )
-    report.recommended_mode = select_inference_mode(
-        InferenceMode.AUTO, report, detection_fps=detection_fps).mode
+    selection = select_inference_mode(InferenceMode.AUTO, report, detection_fps=detection_fps)
+    # Never recommend a mode that cannot run here; AUTO then means "nothing
+    # can detect falls on this agent yet", with the reason attached.
+    supported_modes = report.supported_inference_modes
+    report.recommended_mode = (selection.mode if selection.mode in supported_modes
+                               else InferenceMode.AUTO)
+    report.recommendation_reason = detector_error or selection.reason
     return report

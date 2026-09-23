@@ -10,7 +10,7 @@ import id.mantau.agent.inference.FallEventGate
 import id.mantau.agent.inference.HybridConfirmationPolicy
 import id.mantau.agent.inference.InferenceModePolicy
 import id.mantau.agent.inference.ModeSelection
-import id.mantau.agent.inference.UnavailableMobileDetector
+import id.mantau.agent.inference.fall.MediaPipeFallDetector
 import id.mantau.agent.model.AgentConfig
 import id.mantau.agent.model.CameraConfig
 import id.mantau.agent.model.CameraConnectivity
@@ -59,7 +59,7 @@ class MonitoringEngine(
     private val control = ControlPlaneClient()
     private val discovery = AndroidWsDiscovery(context)
     private val frames = LatestFrameBuffer(2)
-    private val detector = UnavailableMobileDetector()
+    private val detector = MediaPipeFallDetector(context)
     private val thermal = AndroidThermalStateProvider(context)
     private val capabilities = CapabilityBenchmark(context, thermal).run(detector)
     @Volatile private var detectorFailure: String? = null
