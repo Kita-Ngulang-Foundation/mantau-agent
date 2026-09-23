@@ -225,9 +225,36 @@ def _parser() -> argparse.ArgumentParser:
                        help="restore the last known-good configuration before setup")
     status = commands.add_parser("status", help="show the last local health snapshot")
     status.add_argument("--json", action="store_true", dest="as_json")
+    commands.add_parser("claim-code", help="show a fresh claim code for the Mantau app")
+    commands.add_parser("rotate-key", help="replace this agent's secret (proves the current one)")
     discovery = commands.add_parser("discover", help="discover and probe ONVIF cameras")
     discovery.add_argument("--json", action="store_true", dest="as_json")
     return parser
+
+
+def _enrollment_command(command: str, config_path: str | None) -> int:
+    from .setup_wizard import AlreadyClaimed, refresh_claim_code, rotate_secret
+    from .state import ConfigurationStore
+    store = ConfigurationStore(config_path)
+    configuration = store.load()
+    if configuration is None or not configuration.enrollment.agent_secret:
+        print("This agent is not enrolled yet; run `mantau-agent setup --remote`.")
+        return 1
+    enrollment = configuration.enrollment
+    if command == "rotate-key":
+        rotate_secret(store)
+        print("Agent secret rotated. Restart the service to use it.")
+        return 0
+    try:
+        code = refresh_claim_code(enrollment.server_url, enrollment.agent_id,
+                                  enrollment.agent_secret)
+    except AlreadyClaimed:
+        print("This agent already belongs to a household. The owner must remove it "
+              "in the Mantau app before it can be claimed again.")
+        return 1
+    print(f"Claim code: {code}")
+    print("Enter it in the Mantau app within a few minutes; it works once.")
+    return 0
 
 
 def _print_value(value, *, as_json: bool) -> None:
@@ -272,6 +299,8 @@ def cli(argv: list[str] | None = None) -> int:
             store.restore_backup()
             print(f"Restored configuration from {store.backup_path}.")
             return 0
+        if command in ("claim-code", "rotate-key"):
+            return _enrollment_command(command, args.config)
         settings, configuration = load_settings(args.config)
         if args.status_path:
             settings.status_path = args.status_path

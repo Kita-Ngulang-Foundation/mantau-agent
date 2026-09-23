@@ -12,19 +12,51 @@ class ControlPlaneClient(
     private val connectTimeoutMs: Int = 10_000,
     private val readTimeoutMs: Int = 15_000,
 ) {
-    fun enroll(serverUrl: String, agentId: String): Enrollment {
-        val body = request(
-            serverUrl = serverUrl,
-            path = "/agents/enroll",
-            method = "POST",
-            body = JSONObject().put("agent_id", agentId),
-            accepted = setOf(201),
-        ) ?: throw IOException("Enrollment returned no response")
+    /**
+     * Enrolls a new identity, or rotates this identity's secret when
+     * [currentSecret] proves it. The server never lets an unproven request
+     * replace an existing agent: that answers 409 ([AgentIdTakenException]).
+     */
+    fun enroll(serverUrl: String, agentId: String, currentSecret: String? = null): Enrollment {
+        val body = try {
+            request(
+                serverUrl = serverUrl,
+                path = "/agents/enroll",
+                method = "POST",
+                body = JSONObject().put("agent_id", agentId),
+                headers = currentSecret?.let { authHeaders(agentId, it) } ?: emptyMap(),
+                accepted = setOf(201),
+            )
+        } catch (error: ControlPlaneException) {
+            if (error.statusCode == 409) throw AgentIdTakenException()
+            throw error
+        } ?: throw IOException("Enrollment returned no response")
         return Enrollment(
             agentId = body.getString("agent_id"),
             secret = body.getString("secret"),
             claimCode = body.optString("claim_code").takeIf(String::isNotBlank),
         )
+    }
+
+    /**
+     * A fresh single-use claim code for this unclaimed agent. Authenticated by
+     * the agent's own secret and never changes it.
+     */
+    fun refreshClaimCode(serverUrl: String, agentId: String, secret: String): String {
+        val body = try {
+            request(
+                serverUrl = serverUrl,
+                path = "/agent-control/claim-code",
+                method = "POST",
+                body = JSONObject(),
+                headers = authHeaders(agentId, secret),
+                accepted = setOf(201),
+            )
+        } catch (error: ControlPlaneException) {
+            if (error.statusCode == 409) throw AlreadyClaimedException()
+            throw error
+        } ?: throw IOException("Claim code refresh returned no response")
+        return body.getString("claim_code")
     }
 
     fun poll(serverUrl: String, agentId: String, secret: String, status: JSONObject): ControlCommand? {
@@ -93,4 +125,8 @@ class ControlPlaneClient(
 }
 
 class ControlPlaneException(val statusCode: Int) : IOException("Control plane returned HTTP $statusCode")
+
+class AgentIdTakenException : IOException("Another agent already uses this ID")
+
+class AlreadyClaimedException : IOException("This agent already belongs to a household")
 

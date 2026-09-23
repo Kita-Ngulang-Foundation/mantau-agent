@@ -21,6 +21,7 @@ import id.mantau.agent.discovery.AndroidWsDiscovery
 import id.mantau.agent.model.AgentConfig
 import id.mantau.agent.model.CameraConfig
 import id.mantau.agent.model.DiscoveredCamera
+import id.mantau.agent.network.AlreadyClaimedException
 import id.mantau.agent.network.ControlPlaneClient
 import id.mantau.agent.service.MonitoringService
 import id.mantau.agent.storage.AgentConfigStore
@@ -120,7 +121,8 @@ class MainActivity : Activity() {
             setTextIsSelectable(true)
             setPadding(0, dp(8), 0, dp(8))
         }.also { root.addView(it, matchWrap()) }
-        root.addView(button("Enroll / refresh claim code") { confirmEnrollment() })
+        root.addView(button("Enroll / get claim code") { enrollOrRefreshClaimCode() })
+        root.addView(button("Rotate agent key") { confirmRotation() })
 
         root.section("Camera (manual fallback)")
         cameraHost = root.field("Camera IP or hostname")
@@ -192,34 +194,76 @@ class MainActivity : Activity() {
         return config
     }
 
-    private fun confirmEnrollment() {
-        if (store.agentSecret() == null) {
-            enroll()
+    /**
+     * First use enrolls. Afterwards only the claim code is refreshed, with the
+     * agent's own secret -- the secret itself never changes here.
+     */
+    private fun enrollOrRefreshClaimCode() {
+        val secret = store.agentSecret()
+        if (secret == null) {
+            enroll(currentSecret = null)
+            return
+        }
+        val config = runCatching { saveFromUi(showConfirmation = false) }
+            .getOrElse { showError("Cannot refresh claim code", it); return }
+        status.text = "Requesting a claim code…"
+        worker.submit {
+            runCatching { ControlPlaneClient().refreshClaimCode(config.serverUrl, config.agentId, secret) }
+                .onSuccess { code ->
+                    store.save(config.copy(claimCode = code))
+                    runOnUiThread {
+                        claimCode.text = "Claim code: $code"
+                        showMessage("Enter this claim code in the Mantau app within a few minutes. It works once.")
+                    }
+                }
+                .onFailure { error ->
+                    runOnUiThread {
+                        if (error is AlreadyClaimedException) {
+                            store.save(config.copy(claimCode = null))
+                            claimCode.text = "Claimed by a household"
+                            showMessage("This agent already belongs to a household. Remove it in the Mantau app to claim it again.")
+                        } else {
+                            showError("Claim code refresh failed", error)
+                        }
+                    }
+                }
+        }
+    }
+
+    private fun confirmRotation() {
+        val secret = store.agentSecret() ?: run {
+            showMessage("Enroll this agent first.")
             return
         }
         AlertDialog.Builder(this)
-            .setTitle("Rotate enrollment secret?")
-            .setMessage("Refreshing the claim code re-enrolls this agent and immediately invalidates its previous control-plane secret.")
-            .setPositiveButton("Re-enroll") { _, _ -> enroll() }
+            .setTitle("Rotate agent key?")
+            .setMessage("The agent gets a new secret and the old one stops working immediately. Household ownership does not change.")
+            .setPositiveButton("Rotate") { _, _ -> enroll(currentSecret = secret) }
             .setNegativeButton("Cancel", null)
             .show()
     }
 
-    private fun enroll() {
+    private fun enroll(currentSecret: String?) {
         val config = runCatching { saveFromUi(showConfirmation = false) }
             .getOrElse { showError("Cannot enroll", it); return }
         if (config.serverUrl.isBlank()) {
             showMessage("Enter the Mantau server URL first.")
             return
         }
-        status.text = "Enrolling…"
+        status.text = if (currentSecret == null) "Enrolling…" else "Rotating key…"
         worker.submit {
-            runCatching { ControlPlaneClient().enroll(config.serverUrl, config.agentId) }
+            runCatching { ControlPlaneClient().enroll(config.serverUrl, config.agentId, currentSecret) }
                 .onSuccess { enrollment ->
-                    store.save(config.copy(claimCode = enrollment.claimCode), agentSecret = enrollment.secret)
+                    store.save(
+                        config.copy(claimCode = enrollment.claimCode ?: config.claimCode),
+                        agentSecret = enrollment.secret,
+                    )
                     runOnUiThread {
-                        claimCode.text = enrollment.claimCode?.let { "Claim code: $it" } ?: "Enrolled; server returned no claim code"
-                        showMessage("Enrollment complete. Enter this claim code in the Mantau control app.")
+                        enrollment.claimCode?.let { claimCode.text = "Claim code: $it" }
+                        showMessage(
+                            if (currentSecret == null) "Enrollment complete. Enter the claim code in the Mantau app."
+                            else "Agent key rotated. Restart monitoring to use it."
+                        )
                     }
                 }
                 .onFailure { runOnUiThread { showError("Enrollment failed", it) } }

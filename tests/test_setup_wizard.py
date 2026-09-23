@@ -215,3 +215,59 @@ def test_completed_setup_persists_camera_and_inference_mode(monkeypatch, tmp_pat
     assert completed.setup_state is SetupState.COMPLETE
     assert completed.inference_mode is InferenceMode.HYBRID
     assert store.load().camera.host == "192.0.2.20"
+
+
+def test_default_agent_ids_do_not_collide_between_identical_devices():
+    assert wizard.default_agent_id() != wizard.default_agent_id()
+
+
+def test_enroll_reports_a_taken_id_instead_of_failing():
+    client = httpx.Client(transport=httpx.MockTransport(
+        lambda request: httpx.Response(409, json={"detail": "agent_id_taken"})))
+    try:
+        enroll("http://server.local:8100", "agent-1", client=client)
+        assert False, "expected AgentIdTaken"
+    except wizard.AgentIdTaken:
+        pass
+
+
+def test_rotation_proves_the_current_secret_and_saves_the_new_one(tmp_path):
+    from mantau_agent.state import AgentConfiguration, EnrollmentConfiguration, SetupState
+
+    store = ConfigurationStore(tmp_path / "config.json")
+    store.save(AgentConfiguration(
+        setup_state=SetupState.ENROLLED,
+        enrollment=EnrollmentConfiguration(
+            server_url="https://server", agent_id="agent-1", agent_secret="old-secret"),
+    ))
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(201, json={"agent_id": "agent-1", "secret": "new-secret"})
+
+    wizard.rotate_secret(store, client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    assert seen[0].headers["X-Mantau-Agent-ID"] == "agent-1"
+    assert seen[0].headers["X-Mantau-Agent-Secret"] == "old-secret"
+    assert store.load().enrollment.agent_secret == "new-secret"
+
+
+def test_claim_code_refresh_uses_agent_credentials_and_keeps_the_secret():
+    def handler(request):
+        assert request.url.path == "/agent-control/claim-code"
+        assert request.headers["X-Mantau-Agent-Secret"] == "agent-secret"
+        return httpx.Response(201, json={"claim_code": "FRESH123", "expires_at": "x"})
+
+    code = wizard.refresh_claim_code(
+        "https://server", "agent-1", "agent-secret",
+        client=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert code == "FRESH123"
+
+    claimed = httpx.Client(transport=httpx.MockTransport(
+        lambda request: httpx.Response(409, json={"detail": "agent_already_claimed"})))
+    try:
+        wizard.refresh_claim_code("https://server", "agent-1", "agent-secret", client=claimed)
+        assert False, "expected AlreadyClaimed"
+    except wizard.AlreadyClaimed:
+        pass

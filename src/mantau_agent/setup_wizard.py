@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import getpass
+import secrets
 import socket
 import sys
 from pathlib import Path
@@ -35,16 +36,39 @@ def needs_setup(settings: Settings | None = None,
 
 
 def default_agent_id() -> str:
+    """Hostname plus a random suffix: identical images (every Pi is
+    `raspberrypi`) must not collide, because enrollment is create-only."""
     host = socket.gethostname().lower()
     cleaned = "".join(c if c.isalnum() or c == "-" else "-" for c in host).strip("-")
-    return f"agent-{cleaned or 'device'}"
+    return f"agent-{(cleaned or 'device')[:40]}-{secrets.token_hex(3)}"
 
 
-def enroll(server_url: str, agent_id: str, *, client: httpx.Client | None = None) -> str:
+class AgentIdTaken(RuntimeError):
+    """Another agent already enrolled under this id (HTTP 409)."""
+
+
+class AlreadyClaimed(RuntimeError):
+    """The agent belongs to a household; it gets no more claim codes."""
+
+
+def _proof(agent_id: str, secret: str) -> dict[str, str]:
+    return {"X-Mantau-Agent-ID": agent_id, "X-Mantau-Agent-Secret": secret}
+
+
+def enroll(server_url: str, agent_id: str, *, current_secret: str | None = None,
+           client: httpx.Client | None = None) -> str:
+    """Enroll a new identity, or rotate this one's secret when
+    `current_secret` proves it. Returns the new secret; prints a claim code
+    when the agent is still unclaimed. Never prints the secret."""
     owns_client = client is None
     client = client or httpx.Client(timeout=10.0)
     try:
-        resp = client.post(f"{server_url.rstrip('/')}/agents/enroll", json={"agent_id": agent_id})
+        resp = client.post(
+            f"{server_url.rstrip('/')}/agents/enroll", json={"agent_id": agent_id},
+            headers=_proof(agent_id, current_secret) if current_secret else None,
+        )
+        if resp.status_code == 409:
+            raise AgentIdTaken(agent_id)
         resp.raise_for_status()
         if resp.json().get("claim_code"):
             print(f"Claim code: {resp.json()['claim_code']}")
@@ -52,6 +76,37 @@ def enroll(server_url: str, agent_id: str, *, client: httpx.Client | None = None
     finally:
         if owns_client:
             client.close()
+
+
+def refresh_claim_code(server_url: str, agent_id: str, secret: str, *,
+                       client: httpx.Client | None = None) -> str:
+    """A fresh single-use claim code. Does not change the agent secret."""
+    owns_client = client is None
+    client = client or httpx.Client(timeout=10.0)
+    try:
+        resp = client.post(f"{server_url.rstrip('/')}/agent-control/claim-code",
+                           headers=_proof(agent_id, secret))
+        if resp.status_code == 409:
+            raise AlreadyClaimed(agent_id)
+        resp.raise_for_status()
+        return resp.json()["claim_code"]
+    finally:
+        if owns_client:
+            client.close()
+
+
+def rotate_secret(store: ConfigurationStore, *, client: httpx.Client | None = None) -> None:
+    """Replace the saved secret, proving the current one. Household
+    ownership is unchanged; the old secret stops working immediately."""
+    configuration = store.load()
+    if configuration is None or not configuration.enrollment.agent_secret:
+        raise RuntimeError("This agent is not enrolled yet; run `mantau-agent setup`.")
+    enrollment = configuration.enrollment
+    secret = enroll(enrollment.server_url, enrollment.agent_id,
+                    current_secret=enrollment.agent_secret, client=client)
+    store.save(configuration.model_copy(update={
+        "enrollment": enrollment.model_copy(update={"agent_secret": secret}),
+    }))
 
 
 def render_env_file(*, server_url: str, agent_id: str, secret: str, camera: dict) -> str:
@@ -176,12 +231,16 @@ def run_wizard(store: ConfigurationStore | None = None, *, remote: bool = False)
             print(f"Reusing enrollment for {enrollment.agent_id!r}.")
         else:
             server_url = _prompt("Mantau server URL", default="http://localhost:8100")
-            agent_id = _prompt("A name for this device", default=default_agent_id())
-            print(f"Registering {agent_id!r} with the server...")
-            try:
-                secret = enroll(server_url, agent_id)
-            except (httpx.HTTPError, KeyError, ValueError) as exc:
-                raise RuntimeError(f"Enrollment failed: {type(exc).__name__}") from exc
+            while True:
+                agent_id = _prompt("A name for this device", default=default_agent_id())
+                print(f"Registering {agent_id!r} with the server...")
+                try:
+                    secret = enroll(server_url, agent_id)
+                    break
+                except AgentIdTaken:
+                    print("That name is already used by another device; choose another.")
+                except (httpx.HTTPError, KeyError, ValueError) as exc:
+                    raise RuntimeError(f"Enrollment failed: {type(exc).__name__}") from exc
             enrollment = EnrollmentConfiguration(
                 server_url=server_url, agent_id=agent_id, agent_secret=secret)
             store.save(AgentConfiguration(

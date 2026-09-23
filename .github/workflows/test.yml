@@ -1,0 +1,42 @@
+name: Test
+
+on:
+  push:
+    branches: [main, final_product]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read pinned mantau-core commit
+        id: core
+        run: echo "ref=$(tr -d '[:space:]' < mantau-core.ref)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: Kita-Ngulang-Foundation/mantau-core
+          ref: ${{ steps.core.outputs.ref }}
+          path: .deps/mantau-core
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+          pip install -e ".deps/mantau-core"
+          pip install -e ".[dev]"
+      - run: pytest -q
+
+  android:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android-agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: android-actions/setup-android@v3
+      - run: ./gradlew testDebugUnitTest --no-daemon
