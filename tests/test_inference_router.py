@@ -78,7 +78,7 @@ async def rig():
             platform=PlatformType.LINUX_X86_64, architecture="x86_64", cpu="test",
             cpu_count=4, memory_bytes=1024**3, software_version="test",
             detector_backend="mediapipe", supported_detector_backends=["null", "mediapipe"],
-            detector_fps=20,
+            detector_fps=20, cloud_available=cloud is not None,
         ))
         now = [0.0]
         router = InferenceRouter(
@@ -286,13 +286,43 @@ async def test_hung_upload_times_out_and_shutdown_finishes(rig):
 
 
 async def test_missing_inference_adapter_is_degraded_and_never_uses_live_endpoint(rig):
+    no_detector = CapabilityReport(
+        platform=PlatformType.LINUX_X86_64, architecture="x86_64", cpu="test", cpu_count=4,
+        memory_bytes=1024**3, software_version="test", detector_backend="mediapipe",
+        supported_detector_backends=["null"], detector_error="failed")
     router, detector, _, _, live, now = rig(
+        Mode.CLOUD, inference_uplink=None, live_view_enabled=False, capabilities=no_detector)
+    await router.start()
+    await feed(router, now, [0])
+    assert router.mode == Mode.CLOUD
+    assert router.health()["degraded"]
+    assert not router.detector_alive
+    assert live == []
+
+
+async def test_cloud_without_server_inference_falls_back_to_the_local_detector(rig):
+    router, detector, events, _, live, now = rig(
         Mode.CLOUD, inference_uplink=None, live_view_enabled=False)
     await router.start()
     await feed(router, now, [0])
-    assert router.health()["degraded"]
-    assert not router.detector_alive
-    assert live == detector.calls == []
+    assert router.mode == Mode.EDGE and "falling back to EDGE" in router.selection.reason
+    assert detector.calls == [0] and len(events.events) == 1
+
+
+async def test_detector_that_dies_at_runtime_hands_over_to_cloud(rig):
+    class Dying(Detector):
+        def push(self, image, ts):
+            self.calls.append(ts)
+            raise RuntimeError("model crashed")
+
+    router, detector, events, cloud, _, now = rig(
+        Mode.EDGE, detector=Dying(), live_view_enabled=False)
+    await router.start()
+    await feed(router, now, [0, 1000, 2000])
+    assert detector.calls == [0]
+    assert router.mode == Mode.CLOUD and "RuntimeError" in router.selection.reason
+    assert [m["ts_ms"] for _, m in cloud.calls] == [1000, 2000]
+    assert events.events == []
 
 
 async def test_mode_change_flushes_old_work_and_does_not_reset_upload_limit(rig):

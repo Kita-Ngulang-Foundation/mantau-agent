@@ -38,8 +38,11 @@ through `mantau_core.detection.MediapipeDetector`, the Android agent through
 MediaPipe Tasks Pose Landmarker plus a Kotlin port of the same fall rules and the
 same ONNX classifier. Model files are SHA-256 verified against mantau-core's
 pinned manifest before loading, and shared pose-sequence fixtures hold both ports
-to identical fall decisions. CLOUD and HYBRID stay unavailable (no server
-inference endpoint exists) and are never advertised as supported.
+to identical fall decisions. When the server offers inference
+(`GET /inference/capability`), both agents can also upload sampled frames for
+the server to run the same detector (CLOUD), or ask it to confirm local
+detections (HYBRID); a device whose model fails to load or is too slow falls
+back to CLOUD on its own.
 
 ## Linux / Raspberry Pi installation
 
@@ -202,7 +205,8 @@ The principal runtime variables are:
 | `MANTAU_MODEL_DIR` | packaged | Directory with the pinned model files; each is SHA-256 verified before loading |
 | `MANTAU_FALL_CLASSIFIER_ENABLED` | `true` | Learned confirmation layer on top of the fall rules |
 | `MANTAU_DETECTION_FPS` | `15` | Local sample cap and AUTO throughput target (below ~15 fps the fall tracker loses people mid-fall) |
-| `MANTAU_CLOUD_UPLOAD_FPS` | `1` | Cloud sample/attempt cap |
+| `MANTAU_CLOUD_UPLOAD_FPS` | `10` | Frames per second uploaded for server inference (capped by the server's `max_fps`; below ~10 fps the fall tracker loses people mid-fall) |
+| `MANTAU_CLOUD_INFERENCE_ENABLED` | `true` | Use server inference when the server offers it |
 | `MANTAU_HYBRID_CONFIRMATION_FPS` | `0.2` | HYBRID confirmation cap |
 | `MANTAU_LIVE_VIEW_FPS` | `4` | Independent live-view rate |
 | `MANTAU_FRAME_QUEUE_SIZE` | `2` | Pending frames per route; oldest drops first |
@@ -245,27 +249,40 @@ history and additive tables without affecting the old agent.
 | Mode | Effective behavior |
 |---|---|
 | `EDGE` | Run the local detector and send real events only. |
-| `CLOUD` | Upload sampled frames through `InferenceUplink`; skip local detection. |
-| `HYBRID` | Send local events immediately and submit explicitly rate-limited event frames for server confirmation. |
-| `AUTO` | Select EDGE when a production detector initializes and its benchmark (real pose + rules + classifier on a frame with a person) succeeds. If throughput or memory is below budget, CLOUD is chosen only when a cloud transport exists; otherwise EDGE still runs, with the reason. |
+| `CLOUD` | Upload sampled frames to `POST /agents/{id}/inference`; the server runs the fall detector, stores and pushes falls under this agent, and returns them (clips are attached as for local events). No local model is loaded. |
+| `HYBRID` | Send local events immediately and one rate-limited confirmation frame per event; the server's answer is stored on the event (`server_confirmed`). |
+| `AUTO` | EDGE when the detector initializes and its benchmark (real pose + rules + classifier on a frame with a person) keeps up with `MANTAU_DETECTION_FPS` and memory is at least 512 MiB. Otherwise CLOUD when the server offers inference, else a slower EDGE, with the reason. |
 
-Capability reports list only modes that can run: EDGE when the detector loaded and
-benchmarked, CLOUD only with an injected cloud transport, HYBRID only with both.
-With neither, the recommended mode is `AUTO` and the reason says why.
+Explicit choices are honored when they can run; otherwise the mode that still
+detects falls is used: EDGE with a model that fails to load (missing or
+tampered file, runtime error) falls back to CLOUD; CLOUD or HYBRID without
+server inference fall back to EDGE. A detector that throws while running also
+hands the camera over to CLOUD. Only when nothing can run is the requested mode
+kept and health reported as degraded. Capability reports list only modes that
+can run: EDGE when the detector loaded and benchmarked, CLOUD when the server
+offers inference, HYBRID with both.
 
 `NullDetector` remains compatible for wiring tests, but the production router
 suppresses all its output and any event marked `signals.synthetic`. Synthetic
 detections never reach alert or confirmation uplinks.
 
-The server has `/ingest` for signed events/heartbeats, a live-view frame
-endpoint, and the optional authenticated control plane above. It still does not
-expose a server-inference endpoint. CLOUD/HYBRID
-inference is therefore isolated behind `InferenceUplink`; without an injected
-adapter, status reports `cloud_available=false` and `degraded=true`. The agent
-does not invent an endpoint or treat live-view storage as inference. The
-remaining server/core work is an authenticated inference submission contract,
-frame/event correlation and confirmation results, plus a remote capability and
-detailed-health contract.
+Server inference uses its own signed endpoint (`mantau_core.contracts.inference`),
+never the live-view frame endpoint. `HttpInferenceUplink` reads the server's
+capability at startup; if the server does not offer inference, CLOUD/HYBRID do
+not exist on this agent (`cloud_available=false`). Each frame is signed over
+every header and its bytes, refused locally above the server's size limit,
+retried at most once on a network/5xx error with the same frame id (the server
+answers a retry without re-running the detector), dropped once older than the
+server's `max_frame_age_s`, and never spooled.
+
+Latency budget (CLOUD): the fall rules confirm a fall after the person has been
+on the ground for 1 s, so landing-to-alert is that second plus the time from
+capturing the confirming frame to the push request. Measured on a LAN with the
+simulated camera (17 falls, real MediaPipe on the server): capture to push
+request median 87 ms, p95 99 ms, max 109 ms, i.e. about 1.1 s from landing.
+Budget: 2 s from landing to push request on the local network, leaving the rest
+of the 5 s target for WAN upload and FCM delivery. Sequential uploads reached
+about 6.5 fps in that run (each waits for the server's answer).
 
 ## Resilience and health
 

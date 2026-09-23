@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from mantau_core.activity import ActivityEngine
 from mantau_core.detection import Detector, NullDetector, PerceivingDetector
 
-from ..capabilities import CapabilityReport, InferenceMode, select_inference_mode
+from ..capabilities import CapabilityReport, InferenceMode, ModeSelection, select_inference_mode
 from ..uplink.frames import FrameUplink
 from ..uplink.inference import InferenceUplink
 from .sampler import FrameSampler
@@ -107,6 +107,8 @@ class InferenceRouter:
             "activity_rules": [type(rule).__name__ for rule in self.activity.rules],
             "activity_rule_failures": dict(self.activity.failures),
             "clips": self.clips.health() if self.clips is not None else None,
+            "cloud": (self.inference_uplink.health()
+                      if hasattr(self.inference_uplink, "health") else None),
         }
 
     async def start(self) -> None:
@@ -166,10 +168,19 @@ class InferenceRouter:
                 self.last_error = f"{name}: {type(exc).__name__}"
                 if name == "detection":
                     self._detector_ok = False
+                    self._fall_back_to_cloud(f"on-device detector failed ({type(exc).__name__})")
                 else:
                     self.upload_failures[name] += 1
             finally:
                 queue.task_done()
+
+    def _fall_back_to_cloud(self, cause: str) -> None:
+        """A detector that dies while running must not leave the camera
+        unwatched: switch to server inference when it exists."""
+        if self.inference_uplink is None or self.mode is InferenceMode.CLOUD:
+            return
+        self.selection = ModeSelection(mode=InferenceMode.CLOUD,
+                                       reason=f"{cause}; falling back to CLOUD")
 
     async def _detect(self, work: FrameWork) -> None:
         if self.detector is None:

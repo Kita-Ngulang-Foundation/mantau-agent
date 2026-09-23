@@ -42,15 +42,19 @@ async def pipeline_factory(monkeypatch, tmp_path):
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         monkeypatch.setattr(main, "CameraPuller", Puller)
+        # No server here: capability discovery answers "no server inference".
+        async def no_capability(*args, **kwargs):
+            return None
+        monkeypatch.setattr(main, "discover_capability", no_capability)
         monkeypatch.setattr(main, "UplinkClient", lambda *a, **k: UplinkClient(*a, **k, client=client))
         monkeypatch.setattr(main, "FrameUplink", lambda *a, **k: FrameUplink(*a, **k, client=client))
 
-        async def create(**overrides):
+        async def create(inference_uplink=None, **overrides):
             settings = Settings(agent_id="agent", agent_secret="secret", camera_host="localhost",
                                 seq_path=str(tmp_path / "seq"), spool_path=str(tmp_path / "spool.db"),
                                 status_path=str(tmp_path / "status.json"),
                                 poll_interval_s=.001, heartbeat_interval_s=.02, **overrides)
-            pipeline = await main.build_pipeline(settings)
+            pipeline = await main.build_pipeline(settings, inference_uplink=inference_uplink)
             pipelines.append(pipeline)
             return pipeline, calls
 
@@ -124,9 +128,18 @@ async def test_explicit_cloud_does_not_construct_local_detector(pipeline_factory
     def forbidden(*args):
         raise AssertionError("CLOUD must not load a local model")
 
+    class Cloud:
+        async def submit(self, jpeg, **metadata):
+            return True
+
+        async def close(self):
+            pass
+
     monkeypatch.setattr(main, "_build_detector", forbidden)
-    pipeline, _ = await pipeline_factory(inference_mode=Mode.CLOUD, detector_backend="mediapipe")
+    pipeline, _ = await pipeline_factory(inference_mode=Mode.CLOUD, detector_backend="mediapipe",
+                                         inference_uplink=Cloud())
     assert pipeline.router.detector is None
+    assert pipeline.router.mode == Mode.CLOUD
 
 
 @pytest.mark.parametrize("outcome,expected", [

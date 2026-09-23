@@ -17,13 +17,16 @@ detector availability/latency, and thermal state. It maps those facts into the
 existing v1 capability fields and reports the selected mode and explanation in
 the existing status/health fields. It does not add Android-only wire fields.
 
-`AUTO` and `CLOUD` are currently advertised. CLOUD decodes the RTSP H.264
-substream locally and sends signed sampled JPEGs through the existing
-`POST /cameras/{camera_id}/frame` protocol. Defaults are bounded to 1 FPS, 640
-pixels wide, JPEG quality 65, and 256 KiB per frame (with a hard 2 FPS ceiling).
-The work queue keeps at most two latest frames. Frames that exceed limits, age
-out, or encounter an outage are explicitly discarded; live frames are never
-spooled for later upload.
+Advertised modes are the ones that can run: EDGE when the detector loaded and
+benchmarked, CLOUD when the server's `GET /inference/capability` says it runs the
+detector (re-read every heartbeat), HYBRID with both. CLOUD decodes the RTSP
+H.264 substream locally and sends signed JPEGs to `POST /agents/{id}/inference`
+(`uplink/InferenceUplink.kt`, the same contract and golden signature as the
+Python agent) at 10 fps capped by the server's `max_fps`; the server runs the
+fall detector and stores/pushes falls under this agent. Live view keeps its own
+1 FPS upload to `POST /cameras/{camera_id}/frame`. Frames are 640 pixels wide at
+most, refused above the server's size limit, retried once on a network/5xx
+error with the same frame id, dropped once stale, and never spooled.
 
 EDGE runs on the phone (`inference/fall/`): MediaPipe Tasks Pose Landmarker
 (`pose_landmarker_lite.task`, Apache-2.0), a Kotlin port of mantau-AI's fall
@@ -36,13 +39,14 @@ carry the same fields and signal names as the Python agent's and pass through
 the existing cooldown/deduplication gate. Unlike the Python agent there is no
 motion gate: pose runs on every frame the inference loop takes.
 
-HYBRID has a bounded one-confirmation-frame-per-event policy with a five-second
-minimum interval, but remains unavailable because there is also no
-event-correlated server-confirmation endpoint in the shared contract. It never
-uses continuous full-quality video. Unsupported EDGE/HYBRID commands return
-the shared `unsupported` result. AUTO selects EDGE when the detector loaded and
-benchmarked; it falls back to CLOUD for missing/failed detectors or thermal
-pressure and reports a precise explanation.
+HYBRID sends local events immediately plus one confirmation frame per event
+(five-second minimum interval) with the event id; the server's answer is stored
+on the event. AUTO selects EDGE when the detector loaded and its benchmark keeps
+at least 10 fps; otherwise CLOUD when the server offers inference, else the
+slower EDGE. Explicit modes fall back to what can run: EDGE with a model that
+failed to load goes to CLOUD, CLOUD/HYBRID without server inference go to EDGE,
+and a detector that fails while running hands over to CLOUD. Only when nothing
+can run does selection fail, with the reason in status.
 
 ## Build
 
@@ -121,8 +125,8 @@ a development server on the home LAN can be used.
 - H.264 access units are decoded before the bounded JPEG upload queue drops
   frames. A silent stream times out after ten seconds and reconnects; JPEGs
   older than five seconds are discarded before upload.
-- CLOUD status is degraded with an explicit live-view-only explanation because
-  the current server has no cloud detector. Upload success is not detection.
+- CLOUD frames count as uploaded only when the server processed them; falls it
+  detects are alerted by the server, not by this device.
 - A delivered command is encrypted and persisted before the agent submits its
   `running` result. Final results are persisted before submission and replayed
   on redelivery, matching the Linux/Pi custody and idempotency behavior.
