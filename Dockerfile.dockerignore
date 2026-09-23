@@ -1,0 +1,27 @@
+# Build context is mantau-prototype/; send only what the image installs.
+**
+!mantau-AI/
+!mantau-AI/pyproject.toml
+!mantau-AI/README.md
+!mantau-AI/src/
+!mantau-AI/src/**
+!mantau-core/
+!mantau-core/pyproject.toml
+!mantau-core/README.md
+!mantau-core/src/
+!mantau-core/src/**
+!mantau-agent/
+!mantau-agent/pyproject.toml
+!mantau-agent/README.md
+!mantau-agent/src/
+!mantau-agent/src/**
+!mantau-agent/tests/
+!mantau-agent/tests/**
+!protocol/
+!protocol/examples/
+!protocol/examples/**
+**/__pycache__
+**/*.pyc
+**/.venv
+**/.git
+**/.env*

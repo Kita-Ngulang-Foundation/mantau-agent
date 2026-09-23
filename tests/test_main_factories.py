@@ -3,6 +3,8 @@ glue (real signal handling, an indefinite loop) and isn't unit tested; see
 that module's docstring.
 """
 
+import sys
+
 import pytest
 from mantau_core.contracts import StreamProfile
 from mantau_core.detection import NullDetector
@@ -32,7 +34,8 @@ def test_build_detector_defaults_to_null():
     assert isinstance(detector, NullDetector)
 
 
-def test_build_detector_mediapipe_fails_loudly_without_mantau_ai():
+def test_build_detector_mediapipe_fails_loudly_without_mantau_ai(monkeypatch):
+    monkeypatch.setitem(sys.modules, "mantau.api.streaming", None)
     settings = Settings(detector_backend="mediapipe")
     with pytest.raises(ImportError, match="streaming entrypoint"):
         _build_detector(settings)

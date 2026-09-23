@@ -1,0 +1,43 @@
+{
+  "feature_names": [
+    "duration_s",
+    "n_samples",
+    "sample_rate",
+    "cy_start",
+    "cy_end",
+    "cy_delta",
+    "cy_min",
+    "cy_max",
+    "cy_range",
+    "vel_net",
+    "vel_peak",
+    "ar_start",
+    "ar_end",
+    "ar_min",
+    "ar_max",
+    "ar_mean",
+    "ar_delta",
+    "angle_end",
+    "angle_min",
+    "angle_max",
+    "angle_mean",
+    "angle_delta",
+    "head_start",
+    "head_end",
+    "head_min",
+    "head_mean",
+    "cx_range",
+    "cx_abs_delta"
+  ],
+  "threshold": 0.8,
+  "input": "features",
+  "outputs": [
+    "label",
+    "probabilities"
+  ],
+  "positive_class_index": 1,
+  "source_model": "fall_classifier.joblib",
+  "source_sha256": "e592ef0f2bfaa47d8b2374d171e9845e41f8034c6be2646de0a828e6aa6b55c6",
+  "sklearn_version": "1.9.0",
+  "trained_at": "2026-06-10T17:45:47.063756+00:00"
+}

@@ -1,5 +1,6 @@
 import asyncio
 import threading
+from datetime import datetime, timezone
 
 import httpx
 import numpy as np
@@ -149,9 +150,14 @@ async def test_mediapipe_adapter_translation_is_reused(rig):
         def push(self, image, ts):
             return [SimpleNamespace(confidence=.87, track_id=3, velocity=.5)]
 
+        def process(self, image, ts):
+            # The adapter is a PerceivingDetector, so the router calls perceive().
+            return SimpleNamespace(events=self.push(image, ts), people=None)
+
     # Exercise the real core adapter with its missing optional model injected.
     detector = object.__new__(MediapipeDetector)
     detector.camera_id = "cam"
+    detector._clock = lambda: datetime.now(timezone.utc)
     detector._impl = StreamingImplementation()
     router, _, events, _, _, now = rig(detector=detector)
     await router.start()
@@ -188,7 +194,8 @@ async def test_auto_uses_measured_report_and_weak_device_falls_back(rig):
     await feed(strong, now, [0])
     assert strong.mode == Mode.EDGE
     assert detector.calls == [0]
-    weak_report = strong.capabilities.model_copy(update={"detector_fps": 1.0})
+    weak_report = strong.capabilities.model_copy(
+        update={"detector_fps": 1.0, "cloud_available": True})
     weak, detector, _, cloud, _, now = rig(Mode.AUTO, capabilities=weak_report)
     await weak.start()
     await feed(weak, now, [0])

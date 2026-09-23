@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "source": "github.com/Kita-Ngulang-Foundation/mantau-AI (src/mantau/assets)",
+  "artifacts": {
+    "pose_landmarker_lite.task": {
+      "sha256": "59929e1d1ee95287735ddd833b19cf4ac46d29bc7afddbbf6753c459690d574a",
+      "bytes": 5777746,
+      "description": "MediaPipe Pose Landmarker (lite, float16), Apache-2.0, from storage.googleapis.com/mediapipe-models"
+    },
+    "fall_classifier.onnx": {
+      "sha256": "10be959ea994fd8b29242ea6822e885e7457c7606acca64a2b83af68a551e4bd",
+      "bytes": 160392,
+      "description": "Fall confirmation classifier (HistGradientBoosting) exported from fall_classifier.joblib with sklearn-onnx"
+    },
+    "fall_classifier.onnx.json": {
+      "sha256": "a03f1e6b861109e057cb9c624279d498f00c87cd307a6041df2fa9e8b16174a4",
+      "bytes": 821,
+      "description": "Feature schema and decision threshold for fall_classifier.onnx"
+    },
+    "benchmark_person.jpg": {
+      "sha256": "bfdc08ec20b81970de582b102a14a29e5b0b90f6d845df2273703747abe41dc3",
+      "bytes": 11452,
+      "description": "320x240 frame with one standing person (UR Fall Detection dataset, fall-02 cam0) for measuring real pose throughput"
+    }
+  }
+}
