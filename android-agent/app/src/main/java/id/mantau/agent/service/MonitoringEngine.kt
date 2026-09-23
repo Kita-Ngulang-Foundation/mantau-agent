@@ -2,6 +2,10 @@ package id.mantau.agent.service
 
 import android.content.Context
 import android.os.SystemClock
+import id.mantau.agent.activity.ActivityEngine
+import id.mantau.agent.activity.ActivitySettings
+import id.mantau.agent.activity.FrameObservation
+import id.mantau.agent.activity.toFallEvent
 import id.mantau.agent.discovery.AndroidWsDiscovery
 import id.mantau.agent.inference.AndroidH264JpegDecoder
 import id.mantau.agent.inference.AndroidThermalStateProvider
@@ -35,6 +39,7 @@ import id.mantau.agent.storage.AndroidKeystoreSecretStore
 import id.mantau.agent.storage.RuntimeStatusStore
 import id.mantau.agent.uplink.CloudUploadPolicy
 import id.mantau.agent.uplink.DurableUplink
+import id.mantau.agent.uplink.FallEvent
 import id.mantau.agent.uplink.FrameUploadPolicy
 import id.mantau.agent.uplink.Heartbeat
 import id.mantau.agent.uplink.HttpInferenceTransport
@@ -93,6 +98,12 @@ class MonitoringEngine(
         stateDirectory = java.io.File(context.filesDir, "uplink"),
     )
     private val hybridPolicy = HybridConfirmationPolicy()
+    // Prolonged position, nocturnal movement and bathroom duration, on this device's own
+    // observations (EDGE/HYBRID). In CLOUD mode the server runs the same rules.
+    private val activity = ActivityEngine(
+        runCatching { configStore.detectionSettings()?.let(ActivitySettings::parse) }.getOrNull()
+            ?: ActivitySettings(),
+    )
     private val uploadedFrames = AtomicLong()
     private val discardedFrames = AtomicLong()
     private val uploadFailures = AtomicLong()
@@ -209,6 +220,8 @@ class MonitoringEngine(
                     explanation = safeFailure("Camera connection failed", exception),
                 ))
             } finally {
+                // Timers pause across the reconnect instead of counting the outage.
+                activity.cameraLost()
                 decoder.close()
                 frameQueue.clear()
                 rtsp.close()
@@ -260,7 +273,16 @@ class MonitoringEngine(
                         gateCameraId = camera.cameraId
                         eventGate = FallEventGate(camera.cameraId)
                     }
-                    val events = detector.detect(jpeg).mapNotNull { eventGate?.accept(it, Instant.ofEpochMilli(jpeg.capturedAtMs)) }
+                    val perception = detector.perceive(jpeg)
+                    val events = perception.candidates.mapNotNull {
+                        eventGate?.accept(it, Instant.ofEpochMilli(jpeg.capturedAtMs))
+                    }
+                    perception.people?.let { people ->
+                        val observation = FrameObservation(camera.cameraId, Instant.ofEpochMilli(jpeg.capturedAtMs), people)
+                        for (event in activity.update(observation)) {
+                            durableUplink.sendEvent(event.toFallEvent())
+                        }
+                    }
                     for (event in events) {
                         durableUplink.sendEvent(event)
                         if (mode == "HYBRID" && hybridPolicy.shouldUpload(event.eventId, jpeg.capturedAtMs)) {
@@ -434,7 +456,9 @@ class MonitoringEngine(
                 command.payload,
                 expectedCameraId = configStore.load().camera?.cameraId,
             )
+            val parsed = ActivitySettings.parse(settings.raw)
             configStore.saveDetectionSettings(settings.raw)
+            activity.applySettings(parsed)
             CommandResult(
                 command.commandId, "succeeded", message = "Detection settings stored.",
                 data = JSONObject()

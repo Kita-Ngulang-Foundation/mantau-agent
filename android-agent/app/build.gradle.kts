@@ -80,6 +80,10 @@ tasks.withType<Test>().configureEach {
         rootProject.file("../../mantau-core/src/mantau_core/contracts/fixtures/v1").absolutePath,
     )
     systemProperty(
+        "mantau.core.activity.fixtures",
+        rootProject.file("../../mantau-core/src/mantau_core/activity/fixtures/activity_sequences").absolutePath,
+    )
+    systemProperty(
         "mantau.core.detection.fixtures",
         rootProject.file("../../mantau-core/src/mantau_core/detection/fixtures").absolutePath,
     )

@@ -1,6 +1,7 @@
 package id.mantau.agent.inference.fall
 
 import id.mantau.agent.inference.DetectionCandidate
+import id.mantau.agent.inference.FramePerception
 
 /**
  * Poses in, fall candidates out: the part of on-device detection after pose
@@ -12,14 +13,25 @@ import id.mantau.agent.inference.DetectionCandidate
  */
 class FallRulesStage(config: FallConfig = FallConfig(), confirmer: FallConfirmer? = null) {
     private val rules = FallDetector(config, confirmer)
+    private val observer = ObservationTracker(
+        config.aspectRatioHorizontal, config.torsoAngleHorizontal, config.trackMaxAge,
+    )
     private var lastTimestampMs = Long.MIN_VALUE
 
     /** Returns null when the timestamp does not increase (frame ignored). */
-    fun update(people: List<PersonPose>, timestampMs: Long): List<DetectionCandidate>? {
+    fun update(people: List<PersonPose>, timestampMs: Long): List<DetectionCandidate>? =
+        perceive(people, timestampMs, people.firstOrNull()?.imageHeight ?: 1,
+            people.firstOrNull()?.imageWidth ?: 1)?.candidates
+
+    /** Fall candidates plus per-person observations for this frame; null if ignored. */
+    fun perceive(people: List<PersonPose>, timestampMs: Long, height: Int, width: Int): FramePerception? {
         if (timestampMs <= lastTimestampMs) return null
         lastTimestampMs = timestampMs
-        val (_, decisions) = rules.update(people, timestampMs)
-        return decisions.map { toCandidate(it) }
+        val (updates, decisions) = rules.update(people, timestampMs)
+        return FramePerception(
+            candidates = decisions.map { toCandidate(it) },
+            people = observer.observe(people, updates, height, width, timestampMs),
+        )
     }
 
     companion object {

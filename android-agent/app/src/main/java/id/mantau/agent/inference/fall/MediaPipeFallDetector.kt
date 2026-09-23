@@ -9,8 +9,8 @@ import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarker
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
-import id.mantau.agent.inference.DetectionCandidate
 import id.mantau.agent.inference.DetectorAvailability
+import id.mantau.agent.inference.FramePerception
 import id.mantau.agent.inference.MobileDetector
 import id.mantau.agent.uplink.JpegFrame
 import java.nio.ByteBuffer
@@ -22,8 +22,10 @@ import java.nio.ByteOrder
  *
  * Every model file is verified against the pinned manifest before loading; any
  * failure leaves the detector unavailable (EDGE is never advertised) with the reason.
- * Unlike the Python agent there is no motion gate: pose runs on every frame the
- * inference loop takes, which the loop already paces to what the device can process.
+ * Pose tracks every frame the inference loop takes while the scene moves; once it has
+ * been still for a few seconds, [IdleGate] switches to a stateless image-mode check
+ * twice a second, like the Python agent's idle keepalive, so a person who stays
+ * still is still observed and an emptied room reads as empty.
  */
 class MediaPipeFallDetector(
     private val context: Context,
@@ -34,6 +36,8 @@ class MediaPipeFallDetector(
 
     private var poseModel: ByteBuffer? = null
     private var landmarker: PoseLandmarker? = null
+    private var snapshotLandmarker: PoseLandmarker? = null
+    private val idleGate = IdleGate()
     private var classifier: OnnxFallClassifier? = null
     private var stage: FallRulesStage? = null
     private var benchmarkFrame: ByteArray? = null
@@ -80,20 +84,30 @@ class MediaPipeFallDetector(
         }
     }
 
-    override fun detect(frame: JpegFrame): List<DetectionCandidate> {
-        val landmarker = landmarker ?: return emptyList()
-        val stage = stage ?: return emptyList()
+    override fun perceive(frame: JpegFrame): FramePerception {
+        val skipped = FramePerception(emptyList(), null)
+        val landmarker = landmarker ?: return skipped
+        val stage = stage ?: return skipped
         // MediaPipe's video mode rejects non-increasing timestamps; skip such frames.
-        if (frame.capturedAtMs <= lastTimestampMs) return emptyList()
+        if (frame.capturedAtMs <= lastTimestampMs) return skipped
         lastTimestampMs = frame.capturedAtMs
         val bitmap = decode(frame.bytes)
-        val result = landmarker.detectForVideo(BitmapImageBuilder(bitmap).build(), frame.capturedAtMs)
-        return stage.update(toPoses(result, bitmap.height, bitmap.width), frame.capturedAtMs).orEmpty()
+        val image = BitmapImageBuilder(bitmap).build()
+        val result = when (idleGate.update(luma(bitmap), frame.capturedAtMs)) {
+            IdleGate.Pose.TRACK -> landmarker.detectForVideo(image, frame.capturedAtMs)
+            IdleGate.Pose.SNAPSHOT -> (snapshotLandmarker ?: createLandmarker(RunningMode.IMAGE)
+                .also { snapshotLandmarker = it }).detect(image)
+            IdleGate.Pose.SKIP -> return skipped
+        }
+        return stage.perceive(toPoses(result, bitmap.height, bitmap.width), frame.capturedAtMs,
+            bitmap.height, bitmap.width) ?: skipped
     }
 
     override fun close() {
         landmarker?.close()
         landmarker = null
+        snapshotLandmarker?.close()
+        snapshotLandmarker = null
         classifier?.close()
         classifier = null
         stage = null
@@ -129,6 +143,18 @@ class MediaPipeFallDetector(
             if (rgba.width <= MAX_WIDTH) return rgba
             val height = (rgba.height * (MAX_WIDTH.toDouble() / rgba.width)).toInt()
             return Bitmap.createScaledBitmap(rgba, MAX_WIDTH, height, true)
+        }
+
+        /** Brightness of a small thumbnail, for [IdleGate]. */
+        fun luma(bitmap: Bitmap): IntArray {
+            val thumb = Bitmap.createScaledBitmap(bitmap, IdleGate.THUMB_WIDTH, IdleGate.THUMB_HEIGHT, true)
+            val pixels = IntArray(IdleGate.THUMB_WIDTH * IdleGate.THUMB_HEIGHT)
+            thumb.getPixels(pixels, 0, IdleGate.THUMB_WIDTH, 0, 0, IdleGate.THUMB_WIDTH, IdleGate.THUMB_HEIGHT)
+            if (thumb !== bitmap) thumb.recycle()
+            return IntArray(pixels.size) { i ->
+                val p = pixels[i]
+                (((p shr 16) and 0xff) * 299 + ((p shr 8) and 0xff) * 587 + (p and 0xff) * 114) / 1000
+            }
         }
 
         fun toPoses(result: PoseLandmarkerResult, height: Int, width: Int): List<PersonPose> =

@@ -44,6 +44,22 @@ the server to run the same detector (CLOUD), or ask it to confirm local
 detections (HYBRID); a device whose model fails to load or is too slow falls
 back to CLOUD on its own.
 
+### Activity rules
+
+Besides falls, both agents run mantau-core's activity rules on the same pose
+observations, without extra models: prolonged position (on the floor, or
+anywhere outside a seating/bed zone), nocturnal movement (repeated bed exits
+or time out of bed inside the night window) and bathroom duration (someone
+entered the bathroom-door zone and has not been seen since). Each raises a
+warning and later a critical event with its own `kind`, deduplicated by a
+stable event id; signals carry only durations, movement, counts and
+confidence, never images or identities. Timers pause while the camera is
+disconnected, the person is lost or confidence is low. Thresholds, the night
+window and zones come from the camera's detection settings: the saved copy is
+applied on start and every `apply_detection_settings` command replaces it
+(the command channel must be enabled). In CLOUD mode the server runs the same
+rules on the frames it analyses.
+
 ## Linux / Raspberry Pi installation
 
 Build or obtain the binary matching the target:

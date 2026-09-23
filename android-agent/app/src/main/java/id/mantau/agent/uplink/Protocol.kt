@@ -2,11 +2,15 @@ package id.mantau.agent.uplink
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.math.BigDecimal
+import java.math.MathContext
+import java.math.RoundingMode
 import java.time.Instant
 import java.time.format.DateTimeFormatterBuilder
 import java.util.UUID
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
+import kotlin.math.abs
 
 data class FallEvent(
     val eventId: String = UUID.randomUUID().toString().replace("-", ""),
@@ -15,19 +19,25 @@ data class FallEvent(
     val confidence: Double,
     val trackId: Int? = null,
     val signals: Map<String, Double> = emptyMap(),
+    /** mantau-core EventKind: fall, stillness, nocturnal_movement, bathroom_duration. */
+    val kind: String = "fall",
+    val severity: String = "critical",
+    /** The household's zone id for activity events; left out of the payload when null. */
+    val zoneId: String? = null,
 ) {
     init { require(confidence in 0.0..1.0) }
 
     fun toJson(): JSONObject = JSONObject()
         .put("event_id", eventId)
         .put("camera_id", cameraId)
-        .put("kind", "fall")
-        .put("severity", "critical")
+        .put("kind", kind)
+        .put("severity", severity)
         .put("occurred_at", formatInstant(occurredAt))
         .put("confidence", confidence)
         .put("track_id", trackId ?: JSONObject.NULL)
         .put("signals", JSONObject(signals))
         .put("clip", JSONObject.NULL)
+        .also { json -> zoneId?.let { json.put("zone_id", it) } }
 }
 
 data class Heartbeat(
@@ -96,8 +106,37 @@ data class SignedEnvelope(
     }
 }
 
+/**
+ * The exact bytes the server re-derives for a signature: sorted keys, no spaces, and
+ * numbers written the way Python's json.dumps writes them. Envelopes are also sent
+ * and stored in this form, so the server parses back the very values that were
+ * signed (org.json would write 30.0 as 30 and 0.00012 as 1.2E-4).
+ */
 object CanonicalJson {
     fun encode(value: Any?): ByteArray = render(value).toByteArray(Charsets.UTF_8)
+
+    fun string(value: Any?): String = render(value)
+
+    /** Python's repr(float): the shortest digits that round-trip, positional for exponents -4..15. */
+    fun pythonFloat(value: Double): String {
+        require(value.isFinite()) { "JSON has no NaN or Infinity" }
+        if (value == 0.0) return if (1.0 / value < 0) "-0.0" else "0.0"
+        val exact = BigDecimal(value)
+        val shortest = (1..17).asSequence()
+            .map { exact.round(MathContext(it, RoundingMode.HALF_EVEN)) }
+            .first { it.toDouble() == value }
+            .stripTrailingZeros()
+        val digits = shortest.unscaledValue().abs().toString()
+        val exponent = digits.length - 1 - shortest.scale()
+        val sign = if (value < 0) "-" else ""
+        if (exponent in -4..15) {
+            val plain = shortest.abs().toPlainString()
+            return sign + if ('.' in plain) plain else "$plain.0"
+        }
+        val mantissa = if (digits.length == 1) digits else digits[0] + "." + digits.substring(1)
+        val expSign = if (exponent < 0) "-" else "+"
+        return sign + mantissa + "e" + expSign + abs(exponent).toString().padStart(2, '0')
+    }
 
     private fun render(value: Any?): String = when (value) {
         null, JSONObject.NULL -> "null"
@@ -107,7 +146,10 @@ object CanonicalJson {
         is JSONArray -> (0 until value.length()).joinToString(",", "[", "]") { render(value.get(it)) }
         is String -> quote(value)
         is Boolean -> value.toString()
-        is Number -> value.toString().also { require(it != "NaN" && it !in setOf("Infinity", "-Infinity")) }
+        is Double -> pythonFloat(value)
+        is Float -> pythonFloat(value.toDouble())
+        is Int, is Long, is Short, is Byte -> value.toString()
+        is Number -> pythonFloat(value.toDouble())
         else -> quote(value.toString())
     }
 

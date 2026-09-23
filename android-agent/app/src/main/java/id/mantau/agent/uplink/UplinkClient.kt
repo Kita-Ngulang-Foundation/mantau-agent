@@ -18,7 +18,7 @@ class HttpEnvelopeTransport : EnvelopeTransport {
             connection.readTimeout = 10_000
             connection.doOutput = true
             connection.setRequestProperty("Content-Type", "application/json")
-            connection.outputStream.use { it.write(envelope.toJson().toString().toByteArray(Charsets.UTF_8)) }
+            connection.outputStream.use { it.write(CanonicalJson.encode(envelope.toJson())) }
             connection.responseCode in 200..299
         } catch (_: IOException) {
             false
