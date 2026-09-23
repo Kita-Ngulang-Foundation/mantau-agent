@@ -20,6 +20,7 @@ data class CapabilitySnapshot(
     val supportedModes: List<String>,
     val recommendedMode: String,
     val reason: String,
+    val facts: CapabilityFacts? = null,
 ) {
     fun wireFacts(): WirePayloads.CapabilityFacts = WirePayloads.CapabilityFacts(
         architecture = architecture,
@@ -68,43 +69,79 @@ class CapabilityBenchmark(
     private val context: Context,
     private val thermal: ThermalStateProvider = AndroidThermalStateProvider(context),
 ) {
-    fun run(detector: MobileDetector): CapabilitySnapshot {
+    fun run(detector: MobileDetector, cloudAvailable: Boolean = false): CapabilitySnapshot {
         val activity = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         val memory = ActivityManager.MemoryInfo().also(activity::getMemoryInfo).totalMem
         val gpu = activity.deviceConfigurationInfo.glEsVersion
             ?.takeUnless { it == "0.0" }?.let { "opengl_es_$it" }
-        val thermalState = thermal.current()
         val latency = if (detector.availability.available) runCatching { detector.benchmarkLatencyMs() }.getOrNull() else null
-        val detectorReady = detector.availability.available && latency != null
-        val supported = buildList {
-            add("AUTO")
-            add("CLOUD")
-            if (detectorReady) add("EDGE")
-            // HYBRID also requires an event-correlation/confirmation server contract.
-        }
-        val recommended = if (detectorReady && !thermalState.pressured) "EDGE" else "CLOUD"
-        val reason = buildString {
-            append("thermal=${thermalState.wireName}; ")
-            append("detector=${if (detectorReady) detector.backend else "unavailable"}; ")
-            append("inference_latency_ms=${latency?.let { "%.2f".format(java.util.Locale.US, it) } ?: "unavailable"}; ")
-            if (!detectorReady) append(detector.availability.reason)
-            else if (thermalState.pressured) append("Thermal pressure requires CLOUD fallback.")
-            else append("Verified detector benchmark is available for EDGE.")
-        }
-        return CapabilitySnapshot(
+        return CapabilityFacts(
             architecture = Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown",
             memoryBytes = memory,
             gpu = gpu,
             nnapiAvailable = Build.VERSION.SDK_INT >= 27,
             delegates = detector.availability.delegates,
             detectorBackend = detector.backend,
-            detectorAvailable = detectorReady,
+            detectorAvailable = detector.availability.available && latency != null,
+            detectorReason = detector.availability.reason,
             inferenceLatencyMs = latency,
-            thermalState = thermalState,
-            supportedModes = supported,
-            recommendedMode = recommended,
-            reason = reason,
-        )
+        ).snapshot(thermal.current(), cloudAvailable)
     }
 }
 
+/** Device and detector facts measured once; modes are re-derived when cloud or thermal state changes. */
+data class CapabilityFacts(
+    val architecture: String,
+    val memoryBytes: Long,
+    val gpu: String?,
+    val nnapiAvailable: Boolean,
+    val delegates: List<String>,
+    val detectorBackend: String?,
+    val detectorAvailable: Boolean,
+    val detectorReason: String,
+    val inferenceLatencyMs: Double?,
+) {
+    /** EDGE keeps up when one frame takes at most 1000 / [EDGE_MIN_FPS] ms. */
+    val detectorFastEnough: Boolean
+        get() = detectorAvailable && (inferenceLatencyMs ?: Double.MAX_VALUE) <= 1000.0 / EDGE_MIN_FPS
+
+    fun snapshot(thermalState: ThermalState, cloudAvailable: Boolean): CapabilitySnapshot {
+        val supported = buildList {
+            add("AUTO")
+            if (detectorAvailable) add("EDGE")
+            if (cloudAvailable) add("CLOUD")
+            if (detectorAvailable && cloudAvailable) add("HYBRID")
+        }
+        val recommended = when {
+            detectorFastEnough && !thermalState.pressured -> "EDGE"
+            cloudAvailable -> "CLOUD"
+            detectorAvailable -> "EDGE"
+            else -> "AUTO"
+        }
+        val reason = buildString {
+            append("thermal=${thermalState.wireName}; ")
+            append("detector=${if (detectorAvailable) detectorBackend else "unavailable"}; ")
+            append("inference_latency_ms=${inferenceLatencyMs?.let { "%.2f".format(java.util.Locale.US, it) } ?: "unavailable"}; ")
+            append("server_inference=${if (cloudAvailable) "available" else "unavailable"}; ")
+            append(
+                when {
+                    !detectorAvailable && !cloudAvailable -> "$detectorReason No inference mode can run."
+                    !detectorAvailable -> "$detectorReason Using server inference."
+                    !detectorFastEnough && cloudAvailable -> "On-device detector is below ${EDGE_MIN_FPS.toInt()} fps; using server inference."
+                    thermalState.pressured && cloudAvailable -> "Thermal pressure requires CLOUD fallback."
+                    else -> "Verified detector benchmark is available for EDGE."
+                },
+            )
+        }
+        return CapabilitySnapshot(
+            architecture, memoryBytes, gpu, nnapiAvailable, delegates, detectorBackend,
+            detectorAvailable, inferenceLatencyMs, thermalState, supported, recommended, reason,
+            facts = this,
+        )
+    }
+
+    companion object {
+        /** Same floor the fall rules need to track a person through a fall (mantau-AI EVALUATION.md). */
+        const val EDGE_MIN_FPS = 10.0
+    }
+}

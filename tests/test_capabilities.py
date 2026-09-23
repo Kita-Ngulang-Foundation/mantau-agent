@@ -53,9 +53,37 @@ def test_auto_is_deterministic_and_conservative(changes, expected, reason):
 
 @pytest.mark.parametrize("mode", [Mode.EDGE, Mode.CLOUD, Mode.HYBRID])
 def test_explicit_modes_preserve_operator_choice(mode):
-    result = select_inference_mode(mode, report(detector_backend="null"))
+    result = select_inference_mode(mode, report())
     assert result.mode == mode
     assert result.reason == "Explicit operator selection"
+
+
+@pytest.mark.parametrize("requested,changes,expected,reason", [
+    # The edge model failed to load: EDGE/HYBRID fall back to server inference.
+    (Mode.EDGE, {"detector_error": "Configured detector failed to load (ArtifactError)"},
+     Mode.CLOUD, "ArtifactError"),
+    (Mode.HYBRID, {"supported_detector_backends": ["null"]}, Mode.CLOUD, "CLOUD"),
+    # No server inference: CLOUD/HYBRID fall back to the working local detector.
+    (Mode.CLOUD, {"cloud_available": False}, Mode.EDGE, "server inference is unavailable"),
+    (Mode.HYBRID, {"cloud_available": False}, Mode.EDGE, "server inference is unavailable"),
+    # Nothing can run: keep the operator's choice (health reports degraded).
+    (Mode.EDGE, {"detector_backend": "null", "cloud_available": False}, Mode.EDGE, "Explicit"),
+    (Mode.CLOUD, {"detector_backend": "null", "cloud_available": False}, Mode.CLOUD, "Explicit"),
+])
+def test_explicit_modes_fall_back_to_what_can_run(requested, changes, expected, reason):
+    result = select_inference_mode(requested, report(**changes))
+    assert result.mode == expected and reason in result.reason
+
+
+@pytest.mark.parametrize("changes,reason", [
+    ({"detector_error": "Configured detector failed to load (OSError)"}, "No usable"),
+    ({"detector_fps": 2.0}, "throughput"),
+])
+def test_auto_falls_back_to_cloud_when_edge_cannot_keep_up(changes, reason):
+    capabilities = report(**changes)
+    selection = select_inference_mode(Mode.AUTO, capabilities, detection_fps=15)
+    assert selection.mode == Mode.CLOUD and reason in selection.reason
+    assert Mode.CLOUD in capabilities.supported_inference_modes
 
 
 def test_capability_report_json_roundtrip():

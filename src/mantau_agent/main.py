@@ -31,7 +31,9 @@ from .health.status import StatusStore
 from .pipeline import MonitoringPipeline
 from .uplink.client import UplinkClient
 from .uplink.frames import FrameUplink
-from .uplink.inference import InferenceUplink
+from .uplink.inference import (
+    HttpInferenceUplink, InferenceUplink, cloud_rate, discover_capability,
+)
 from .uplink.seq import SeqCounter
 from .uplink.spool import EnvelopeSpool
 from .uplink.tunnel import NullTunnel, TailscaleTunnel, TunnelProvider
@@ -93,18 +95,22 @@ async def _discover_camera(settings: Settings) -> CameraRef:
 def _probe_capabilities(settings: Settings, *, cloud_available: bool = False):
     probe = None
     error = None
+    # With server inference available, a detector that will not load is a
+    # fallback to CLOUD, not a fatal error, whatever mode was requested.
+    tolerate = settings.inference_mode == InferenceMode.AUTO or cloud_available
     try:
-        if settings.inference_mode != InferenceMode.CLOUD:
+        # CLOUD needs no local model unless there is no cloud to fall back on.
+        if settings.inference_mode != InferenceMode.CLOUD or not cloud_available:
             try:
                 probe = _build_detector(settings)
             except ImportError:
-                if settings.inference_mode != InferenceMode.AUTO:
+                if not tolerate:
                     raise  # Preserve MediaPipe's actionable construction error.
                 error = "Configured detector unavailable; install mantau-core[detection] streaming adapter"
             except (RuntimeError, OSError, ValueError) as exc:
                 # Missing/tampered model files or a runtime that will not load.
                 # Only the type and our own message cross this boundary.
-                if settings.inference_mode != InferenceMode.AUTO:
+                if not tolerate:
                     raise
                 error = f"Configured detector failed to load ({type(exc).__name__})"
         return inspect_capabilities(
@@ -120,10 +126,14 @@ def _probe_capabilities(settings: Settings, *, cloud_available: bool = False):
 async def build_pipeline(settings: Settings, *,
                          inference_uplink: InferenceUplink | None = None,
                          configuration_store=None) -> MonitoringPipeline:
-    """Cloud adapter is injected until core/server publish an inference contract.
+    """Build the monitoring pipeline.
 
-    Ownership of the injected adapter transfers to the returned pipeline only
-    after successful construction.
+    Server inference: unless an adapter is injected (tests), the server's
+    `GET /inference/capability` decides whether an `HttpInferenceUplink` exists.
+    With one, CLOUD/HYBRID are real modes and a detector that fails to load or
+    benchmarks too slowly falls back to CLOUD automatically. Ownership of the
+    adapter transfers to the returned pipeline only after successful
+    construction.
     """
     if not settings.agent_id or not settings.agent_secret:
         raise SystemExit(
@@ -132,11 +142,25 @@ async def build_pipeline(settings: Settings, *,
         )
 
     camera = await _discover_camera(settings)
+    cloud_upload_fps = settings.cloud_upload_fps
+    owned_uplink = None
+    if inference_uplink is None and settings.cloud_inference_enabled:
+        capability = await discover_capability(settings.server_url)
+        if capability is not None and capability.available:
+            inference_uplink = owned_uplink = HttpInferenceUplink(
+                settings.server_url, settings.agent_id, settings.agent_secret, capability)
+            cloud_upload_fps = cloud_rate(settings.cloud_upload_fps, capability)
+        else:
+            logging.getLogger(__name__).warning(
+                "Server inference unavailable: %s",
+                capability.reason if capability is not None else "no capability response")
     capabilities = await asyncio.to_thread(
         _probe_capabilities, settings, cloud_available=inference_uplink is not None)
     async with AsyncExitStack() as cleanup:
+        if owned_uplink is not None:
+            cleanup.push_async_callback(owned_uplink.close)
         detector = None
-        if (settings.inference_mode != InferenceMode.CLOUD
+        if ((settings.inference_mode != InferenceMode.CLOUD or inference_uplink is None)
                 and settings.detector_backend in capabilities.supported_detector_backends):
             detector = await asyncio.to_thread(_build_detector, settings)
             cleanup.push_async_callback(asyncio.to_thread, detector.close)
@@ -164,6 +188,9 @@ async def build_pipeline(settings: Settings, *,
                 encode_jpeg=frames.encode, spool_dir=settings.clip_spool_dir,
                 fps=settings.clip_fps, pre_s=settings.clip_pre_s, post_s=settings.clip_post_s,
             )
+            if owned_uplink is not None:
+                # Falls the server detects get the same review clip as local ones.
+                owned_uplink.on_events = lambda events: [clips.on_event(e) for e in events]
         router = InferenceRouter(
             camera_id=settings.camera_id, detector=detector, event_uplink=uplink,
             activity=activity, clips=clips,
@@ -171,7 +198,7 @@ async def build_pipeline(settings: Settings, *,
             inference_uplink=inference_uplink,
             sampler=FrameSampler(keep_every_n=settings.sampler_keep_every_n,
                                  max_fps=settings.sampler_max_fps),
-            detection_fps=settings.detection_fps, cloud_upload_fps=settings.cloud_upload_fps,
+            detection_fps=settings.detection_fps, cloud_upload_fps=cloud_upload_fps,
             confirmation_fps=settings.hybrid_confirmation_fps,
             live_view_fps=settings.live_view_fps, live_view_enabled=settings.live_view_enabled,
             queue_size=settings.frame_queue_size, upload_timeout_s=settings.upload_timeout_s,

@@ -54,7 +54,13 @@ class Settings(CoreSettings):
     # 15 fps matched full-frame-rate accuracy on the UR Fall and Y-B-Class clips;
     # at 5-10 fps the tracker loses the person mid-fall and recall drops.
     detection_fps: float = Field(default=15.0, gt=0, allow_inf_nan=False)
-    cloud_upload_fps: float = Field(default=1.0, gt=0, le=2.0, allow_inf_nan=False)
+    # CLOUD sends frames for the server to run the fall detector on. Below
+    # ~10 fps the fall tracker loses people mid-fall (mantau-AI
+    # docs/EVALUATION.md); the server's advertised max_fps caps this.
+    cloud_upload_fps: float = Field(default=10.0, gt=0, le=15.0, allow_inf_nan=False)
+    # Use server inference when the server offers it (CLOUD/HYBRID and the
+    # automatic fallback when the on-device detector cannot run).
+    cloud_inference_enabled: bool = True
     hybrid_confirmation_fps: float = Field(default=0.2, gt=0, allow_inf_nan=False)
     frame_queue_size: int = Field(default=2, ge=1)
     upload_timeout_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)

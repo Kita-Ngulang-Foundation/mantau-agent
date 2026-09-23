@@ -94,7 +94,7 @@ def select_inference_mode(requested: InferenceMode, report: CapabilityReport,
                           *, detection_fps: float = 5.0) -> ModeSelection:
     requested = InferenceMode(requested)
     if requested != InferenceMode.AUTO:
-        return ModeSelection(mode=requested, reason="Explicit operator selection")
+        return _explicit(requested, report)
     if not report.detector_usable:
         suffix = "" if report.cloud_available else "; cloud inference is unavailable"
         return ModeSelection(mode=InferenceMode.CLOUD,
@@ -112,6 +112,31 @@ def select_inference_mode(requested: InferenceMode, report: CapabilityReport,
                              reason=constrained + "; cloud inference is unavailable, so EDGE")
     return ModeSelection(mode=InferenceMode.EDGE,
                          reason="Production detector measured at or above requested rate with sufficient memory")
+
+
+def _explicit(requested: InferenceMode, report: CapabilityReport) -> ModeSelection:
+    """Honor the operator's choice when it can run here. When it cannot, fall
+    back to the mode that still detects falls rather than running nothing; if
+    nothing can, keep the choice (health reports it degraded)."""
+    edge, cloud = report.detector_usable, report.cloud_available
+    unavailable = report.detector_error or "on-device detector unavailable"
+    if requested is InferenceMode.EDGE and not edge and cloud:
+        return ModeSelection(mode=InferenceMode.CLOUD,
+                             reason=f"EDGE requested but {unavailable}; falling back to CLOUD")
+    if requested is InferenceMode.CLOUD and not cloud and edge:
+        return ModeSelection(mode=InferenceMode.EDGE,
+                             reason="CLOUD requested but server inference is unavailable; "
+                                    "falling back to EDGE")
+    if requested is InferenceMode.HYBRID and not (edge and cloud):
+        if edge:
+            return ModeSelection(mode=InferenceMode.EDGE,
+                                 reason="HYBRID requested but server inference is unavailable; "
+                                        "falling back to EDGE")
+        if cloud:
+            return ModeSelection(mode=InferenceMode.CLOUD,
+                                 reason=f"HYBRID requested but {unavailable}; "
+                                        "falling back to CLOUD")
+    return ModeSelection(mode=requested, reason="Explicit operator selection")
 
 
 def _read(path: str) -> str:

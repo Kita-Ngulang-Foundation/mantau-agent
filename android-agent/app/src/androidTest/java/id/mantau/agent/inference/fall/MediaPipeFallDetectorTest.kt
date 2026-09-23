@@ -89,6 +89,60 @@ class MediaPipeFallDetectorTest {
         assertEquals(emptyList<FallEvent>(), result!!.first)
     }
 
+    /**
+     * EDGE deliberately unused: the recorded frames go to the server's inference endpoint
+     * through the same HttpInferenceUplink the engine uses in CLOUD mode, and the server's
+     * detector must report the fall. Frames are paced in real time at 15 fps and stamped
+     * on the server's clock (read from its Date header) so an emulator clock drift cannot
+     * make them look stale.
+     */
+    @Test
+    fun serverInferenceDetectsTheFallWhenEdgeIsNotUsed() {
+        val server = args.getString("e2eServer").orEmpty()
+        assumeTrue("pass -e e2eServer to run against a live mantau-server", server.isNotBlank())
+        val frames = frames("video1")
+        assumeTrue("run scripts/prepare-instrumentation-frames.sh first", frames != null)
+        val transport = id.mantau.agent.uplink.HttpInferenceTransport()
+        val capability = requireNotNull(id.mantau.agent.uplink.discoverInferenceCapability(server, transport))
+        assertTrue(capability.reason ?: "", capability.available)
+        val offsetMs = serverClockOffsetMs(server)
+        val uplink = id.mantau.agent.uplink.HttpInferenceUplink(
+            serverUrl = { server }, agentId = { requireNotNull(args.getString("e2eAgentId")) },
+            secret = { requireNotNull(args.getString("e2eSecret")) }, capability = capability,
+            transport = transport, wallClockMs = { System.currentTimeMillis() + offsetMs },
+        )
+        val cameraId = args.getString("e2eCameraId") ?: "cam-1"
+        val start = System.currentTimeMillis() + offsetMs
+        val serverEvents = mutableListOf<String>()
+        val started = System.nanoTime()
+        var sent = 0
+        frames!!.forEachIndexed { index, (jpeg, t) ->
+            if (index % 2 == 1) return@forEachIndexed  // 30 fps clip -> 15 fps uploads
+            val dueNs = started + t * 1_000_000
+            val waitMs = (dueNs - System.nanoTime()) / 1_000_000
+            if (waitMs > 0) Thread.sleep(waitMs)
+            assertTrue(uplink.lastError ?: "", uplink.submit(jpeg, cameraId, start + t))
+            sent++
+            serverEvents += uplink.lastResult?.eventIds.orEmpty()
+        }
+        println("MANTAU_ANDROID_CLOUD_FRAMES=$sent EVENTS=$serverEvents")
+        assertEquals(1, serverEvents.size)
+    }
+
+    private fun serverClockOffsetMs(server: String): Long {
+        val connection = java.net.URL("${server.trimEnd('/')}/health").openConnection()
+            as java.net.HttpURLConnection
+        return try {
+            val sentAt = System.currentTimeMillis()
+            connection.responseCode
+            val serverMs = connection.getHeaderFieldDate("Date", sentAt)
+            // Date has one-second resolution; half a second is the best unbiased estimate.
+            serverMs + 500 - (sentAt + System.currentTimeMillis()) / 2
+        } finally {
+            connection.disconnect()
+        }
+    }
+
     @Test
     fun detectedFallIsAcceptedByRunningServer() {
         val server = args.getString("e2eServer").orEmpty()
