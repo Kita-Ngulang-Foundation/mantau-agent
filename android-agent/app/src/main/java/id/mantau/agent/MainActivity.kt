@@ -267,7 +267,7 @@ class MainActivity : Activity() {
     }
 
     private fun requestNotificationThenStart() {
-        val config = runCatching { saveFromUi(showConfirmation = false).also { it.validate(requireCamera = true) } }
+        val config = runCatching { saveFromUi(showConfirmation = false).also { it.validate(requireCamera = false) } }
             .getOrElse { showError("Cannot start", it); return }
         if (config.serverUrl.isBlank() || store.agentSecret().isNullOrBlank()) {
             showMessage("Enroll this agent with the control plane before starting monitoring.")

@@ -55,6 +55,7 @@ class AgentConfiguration(BaseModel):
             "agent_id": self.enrollment.agent_id,
             "agent_secret": self.enrollment.agent_secret,
             "inference_mode": self.inference_mode,
+            "command_channel_enabled": True,
         }
         if self.camera is not None:
             values.update({

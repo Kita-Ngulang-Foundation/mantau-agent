@@ -88,6 +88,12 @@ class CompletedCommandStore:
             return {}
 
 
+class CameraCommandError(Exception):
+    def __init__(self, reason: CommandFailureReason):
+        self.reason = reason
+        super().__init__(reason.value)
+
+
 class CommandExecutor:
     def __init__(self, settings, pipeline, *, config_store: ConfigurationStore | None = None,
                  restart_requested: Callable[[], None] | None = None) -> None:
@@ -111,11 +117,14 @@ class CommandExecutor:
                 "supported_detector_backends": caps.get("supported_detector_backends", []),
                 "software_version": caps["software_version"],
                 "recommended_mode": caps["recommended_mode"],
-                "supported_inference_modes": [mode.value for mode in InferenceMode],
+                "supported_inference_modes": ([mode.value for mode in InferenceMode]
+                    if caps.get("detector_backend") not in (None, "null")
+                    and caps.get("detector_backend") in caps.get("supported_detector_backends", [])
+                    else ["AUTO", "CLOUD"]),
                 "recommendation_reason": caps.get("detector_error"),
             },
-            "setup_status": "active",
-            "health_state": "degraded" if health["routing"].get("degraded") else "online",
+            "setup_status": "active" if self.settings.camera_host else "not_started",
+            "health_state": "degraded" if (health["routing"].get("degraded") or not health["camera"]["connected"]) else "online",
             "requested_inference_mode": self.settings.inference_mode.value,
             "effective_inference_mode": health["effective_inference_mode"],
             "camera_connectivity": "connected" if health["camera"]["connected"] else "disconnected",
@@ -129,6 +138,13 @@ class CommandExecutor:
                                  message=message, data=data)
         except asyncio.CancelledError:
             raise
+        except CameraCommandError as exc:
+            return CommandResult(command_id=command.command_id, state=CommandState.FAILED,
+                                 failure_reason=exc.reason, message="Camera connection failed. Check camera settings.")
+        except NotImplementedError:
+            return CommandResult(command_id=command.command_id, state=CommandState.FAILED,
+                                 failure_reason=CommandFailureReason.UNSUPPORTED,
+                                 message="Requested inference mode is unavailable on this agent.")
         except Exception as exc:
             # Exception text can contain URLs or credentials from third-party
             # libraries. Only the type crosses the reporting/logging boundary.
@@ -154,7 +170,9 @@ class CommandExecutor:
             profile = StreamProfile.SUB if command.payload.get("sub_path") else StreamProfile.MAIN
             failure = await validate_camera(camera, profile=profile)
             if failure:
-                raise RuntimeError("camera validation failed")
+                reason = (CommandFailureReason.AUTHENTICATION_FAILED if "auth_failed" in failure
+                          else CommandFailureReason.CAMERA_UNREACHABLE)
+                raise CameraCommandError(reason)
             if command.command_type is CommandType.CONFIGURE_CAMERA:
                 current = self.config_store.load()
                 if current is None:
@@ -176,6 +194,8 @@ class CommandExecutor:
             return {"success": True}, "Camera connection succeeded."
         if command.command_type is CommandType.SET_INFERENCE_MODE:
             mode = InferenceMode(command.payload["mode"])
+            if mode.value not in self.status()["capabilities"]["supported_inference_modes"]:
+                raise NotImplementedError
             await self.pipeline.change_mode(mode)
             current = self.config_store.load()
             if current is not None:

@@ -31,6 +31,7 @@ class FrameUplink:
         fps: float = 4.0,
         jpeg_quality: int = 70,
         max_width: int = 640,
+        max_bytes: int = 256 * 1024,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self.server_url = server_url.rstrip("/")
@@ -40,6 +41,7 @@ class FrameUplink:
         self._interval_s = 1.0 / fps if fps > 0 else 0.0
         self._jpeg_quality = jpeg_quality
         self._max_width = max_width
+        self._max_bytes = max_bytes
         self._client = client or httpx.AsyncClient(timeout=5.0)
         self._owns_client = client is None
 
@@ -53,7 +55,8 @@ class FrameUplink:
         ok, buf = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), self._jpeg_quality])
         if not ok:
             return None
-        return buf.tobytes()
+        jpeg = buf.tobytes()
+        return jpeg if len(jpeg) <= self._max_bytes else None
 
     def _signature(self, jpeg: bytes) -> str:
         return hmac.new(
@@ -63,6 +66,8 @@ class FrameUplink:
         ).hexdigest()
 
     async def push(self, jpeg: bytes) -> bool:
+        if len(jpeg) > self._max_bytes:
+            return False
         try:
             resp = await self._client.post(
                 f"{self.server_url}/cameras/{self.camera_id}/frame",

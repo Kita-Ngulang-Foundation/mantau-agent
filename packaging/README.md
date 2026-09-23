@@ -2,6 +2,7 @@
 
 The agent ships as one PyInstaller binary per Linux architecture. Raspberry Pi
 is the Linux ARM64 deployment profile; it does not have a separate codebase.
+Builds use Debian Bookworm (glibc 2.36); use Bookworm or newer target systems.
 
 ## Build both artifacts
 
@@ -53,8 +54,15 @@ The idempotent installer:
 - creates `/etc/mantau-agent` and `/var/lib/mantau-agent` as private,
   service-owned directories;
 - installs the systemd unit with restart, hardening, and explicit writable paths;
-- runs one-time enrollment/camera validation when no configuration exists;
-- enables and starts the service after validated configuration exists.
+- runs enrollment and displays the claim code when no configuration exists;
+- starts the command worker before a camera is configured, so setup can finish
+  from the separate Mantau app phone. The private configuration directory is
+  writable by the service to persist validated remote camera changes.
+
+For manual enrollment without the installer, use `mantau-agent setup --remote`
+followed by `mantau-agent run`. The existing `mantau-agent setup` command retains
+interactive local camera validation. File-based enrollment enables command
+polling; legacy environment-only installations retain their previous default.
 
 For image creation or another pre-seeded flow, `--no-setup` installs and enables
 the unit without starting it when configuration is absent:

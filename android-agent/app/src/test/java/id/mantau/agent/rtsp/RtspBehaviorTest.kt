@@ -8,6 +8,45 @@ import java.time.Instant
 
 class RtspBehaviorTest {
     @Test
+    fun `silent camera fails boundedly so capture can reconnect`() {
+        val server = java.net.ServerSocket(0)
+        val finished = java.util.concurrent.CountDownLatch(1)
+        val worker = Thread {
+            server.accept().use { socket ->
+                val reader = socket.getInputStream().bufferedReader()
+                val output = socket.getOutputStream()
+                repeat(4) {
+                    val request = reader.readLine()
+                    var cseq = "1"
+                    while (true) {
+                        val line = reader.readLine() ?: break
+                        if (line.isEmpty()) break
+                        if (line.startsWith("CSeq:", true)) cseq = line.substringAfter(':').trim()
+                    }
+                    val sdp = if (request.startsWith("DESCRIBE"))
+                        "v=0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=control:track1\r\n" else ""
+                    output.write(("RTSP/1.0 200 OK\r\nCSeq: $cseq\r\nSession: test\r\nContent-Length: ${sdp.length}\r\n\r\n$sdp").toByteArray())
+                    output.flush()
+                }
+                finished.await(5, java.util.concurrent.TimeUnit.SECONDS)
+            }
+        }
+        worker.start()
+        try {
+            RtspClient(streamIdleTimeoutMs = 50).use { client ->
+                assertThrows(RtspException::class.java) {
+                    client.stream(id.mantau.agent.model.CameraConfig(host = "127.0.0.1", port = server.localPort),
+                        null, LatestFrameBuffer(), { false })
+                }
+            }
+        } finally {
+            finished.countDown()
+            server.close()
+            worker.join(2_000)
+        }
+    }
+
+    @Test
     fun `latest frame queue drops oldest at its bound`() {
         val queue = LatestFrameBuffer(2)
         (1..3).forEach { value ->

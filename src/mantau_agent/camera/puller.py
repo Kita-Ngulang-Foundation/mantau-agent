@@ -61,6 +61,8 @@ class CameraPuller:
         return cap
 
     def start(self) -> None:
+        if not self.camera.host:
+            return  # Enrolled agents poll commands before a camera is configured.
         if self._thread is not None:
             return
         self._thread = threading.Thread(

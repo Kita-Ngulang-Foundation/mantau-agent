@@ -68,8 +68,7 @@ class MonitoringEngine(
         thermal = thermal,
     )
     @Volatile private var selection = ModeSelection("AUTO", "CLOUD", capabilities.reason)
-    private val frameQueue = LatestWorkQueue<id.mantau.agent.rtsp.EncodedFrame>(2)
-    @Volatile private var videoFormat: VideoFormat? = null
+    private val frameQueue = LatestWorkQueue<id.mantau.agent.uplink.JpegFrame>(2)
     private val uploadPolicy = FrameUploadPolicy()
     private val frameUploader = SignedFrameUploader(
         serverUrl = { configStore.load().serverUrl },
@@ -154,6 +153,7 @@ class MonitoringEngine(
                 continue
             }
             val rtsp = RtspClient()
+            val decoder = AndroidH264JpegDecoder(uploadPolicy.maxWidth, uploadPolicy.jpegQuality)
             activeRtsp = rtsp
             try {
                 rtsp.stream(camera, configStore.cameraPassword(), frames, { !running.get() }, object : RtspClient.Listener {
@@ -166,12 +166,14 @@ class MonitoringEngine(
                     }
 
                     override fun onFormat(format: VideoFormat) {
-                        videoFormat = format
+                        decoder.configure(format)
                     }
 
                     override fun onFrame(frame: id.mantau.agent.rtsp.EncodedFrame) {
                         reconnect.reset()
-                        frameQueue.offer(frame)
+                        // Feed every H.264 access unit; dropping compressed reference
+                        // frames before decoding corrupts subsequent P/B frames.
+                        decoder.decode(frame)?.let(frameQueue::offer)
                         val second = frame.capturedAt.epochSecond
                         if (second != lastPersistedFrameSecond) {
                             lastPersistedFrameSecond = second
@@ -196,6 +198,8 @@ class MonitoringEngine(
                     explanation = safeFailure("Camera connection failed", exception),
                 ))
             } finally {
+                decoder.close()
+                frameQueue.clear()
                 rtsp.close()
                 if (activeRtsp === rtsp) activeRtsp = null
             }
@@ -205,14 +209,12 @@ class MonitoringEngine(
     }
 
     private fun inferenceLoop() {
-        val decoder = AndroidH264JpegDecoder(uploadPolicy.maxWidth, uploadPolicy.jpegQuality)
         var gateCameraId: String? = null
         var eventGate: FallEventGate? = null
         try {
             while (running.get()) {
-                val encoded = frameQueue.take() ?: break
-                val format = videoFormat
-                if (format == null) {
+                val jpeg = frameQueue.take() ?: break
+                if (Instant.now().toEpochMilli() - jpeg.capturedAtMs > 5_000) {
                     discardedFrames.incrementAndGet()
                     continue
                 }
@@ -222,8 +224,6 @@ class MonitoringEngine(
                     continue
                 }
                 try {
-                    decoder.configure(format)
-                    val jpeg = decoder.decode(encoded) ?: continue
                     val config = configStore.load()
                     val camera = config.camera ?: continue
                     if (mode == "CLOUD") {
@@ -243,7 +243,7 @@ class MonitoringEngine(
                         gateCameraId = camera.cameraId
                         eventGate = FallEventGate(camera.cameraId)
                     }
-                    val events = detector.detect(jpeg).mapNotNull { eventGate?.accept(it, encoded.capturedAt) }
+                    val events = detector.detect(jpeg).mapNotNull { eventGate?.accept(it, Instant.ofEpochMilli(jpeg.capturedAtMs)) }
                     for (event in events) {
                         durableUplink.sendEvent(event)
                         if (mode == "HYBRID" && hybridPolicy.shouldUpload(event.eventId, jpeg.capturedAtMs)) {
@@ -262,7 +262,6 @@ class MonitoringEngine(
                 }
             }
         } finally {
-            decoder.close()
             detector.close()
         }
     }
@@ -341,8 +340,9 @@ class MonitoringEngine(
             control.submitResult(config.serverUrl, config.agentId, secret, it)
             return
         }
-        val command = ledger.inflight(delivered.commandId) ?: delivered.also(ledger::putInflight)
-        if (Instant.parse(command.expiresAt).isBefore(Instant.now())) {
+        val recovered = ledger.inflight(delivered.commandId)
+        val command = recovered ?: delivered.also(ledger::putInflight)
+        if (recovered == null && Instant.parse(command.expiresAt).isBefore(Instant.now())) {
             val expired = CommandResult(
                 command.commandId, "failed", "expired", "Command expired before execution.",
             )

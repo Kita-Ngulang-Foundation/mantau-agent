@@ -75,6 +75,9 @@ The phone must run Android 8.0/API 26 or newer. In the app:
    **Enroll / refresh claim code**. Re-enrollment is explicitly confirmed
    because it rotates the agent secret.
 2. Enter the displayed claim code in `mantau-app`.
+   Tap **Start** on the Android Agent even if no camera is configured yet.
+   The foreground service polls setup commands while the camera is unconfigured;
+   its activity may then be closed while setup continues from the family phone.
 3. Connect the phone to the same local Wi-Fi as the CCTV. Run ONVIF discovery
    and explicitly choose among multiple cameras, or enter the camera IP, RTSP
    port, paths, and credentials manually.
@@ -111,6 +114,11 @@ a development server on the home LAN can be used.
   drop-oldest buffer bounds memory. Camera state, completed-frame time, and
   reconnect count are persisted without credentials. Reconnect uses capped
   full-jitter exponential backoff.
+- H.264 access units are decoded before the bounded JPEG upload queue drops
+  frames. A silent stream times out after ten seconds and reconnects; JPEGs
+  older than five seconds are discarded before upload.
+- CLOUD status is degraded with an explicit live-view-only explanation because
+  the current server has no cloud detector. Upload success is not detection.
 - A delivered command is encrypted and persisted before the agent submits its
   `running` result. Final results are persisted before submission and replayed
   on redelivery, matching the Linux/Pi custody and idempotency behavior.

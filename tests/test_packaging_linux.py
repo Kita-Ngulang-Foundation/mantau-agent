@@ -14,6 +14,8 @@ def test_systemd_unit_runs_unprivileged_with_restart_and_safe_paths():
     assert "MANTAU_COMMAND_STATE_PATH=/var/lib/mantau-agent/commands.json" in unit
     assert "ProtectSystem=strict" in unit
     assert "UMask=0077" in unit
+    assert "ReadWritePaths=/etc/mantau-agent /var/lib/mantau-agent" in unit
+    assert "ReadOnlyPaths=/etc/mantau-agent" not in unit
 
 
 def test_installer_supports_x86_64_and_arm64_and_does_not_claim_android():

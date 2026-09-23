@@ -22,7 +22,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 class RtspException(message: String) : IOException(message)
 class RtspAuthenticationException(message: String) : IOException(message)
 
-class RtspClient(private val connectTimeoutMs: Int = 5_000) : AutoCloseable {
+class RtspClient(private val connectTimeoutMs: Int = 5_000,
+                 private val streamIdleTimeoutMs: Long = 10_000) : AutoCloseable {
     @Volatile private var activeSocket: Socket? = null
 
     fun stream(
@@ -91,8 +92,15 @@ class RtspClient(private val connectTimeoutMs: Int = 5_000) : AutoCloseable {
         cancelled: () -> Boolean,
         listener: Listener,
     ) {
-        val assembler = H264FrameAssembler(frames, onFrame = { listener.onFrame(it) })
+        var lastFrameAt = System.nanoTime()
+        val assembler = H264FrameAssembler(frames, onFrame = {
+            lastFrameAt = System.nanoTime()
+            listener.onFrame(it)
+        })
         while (!cancelled()) {
+            if (System.nanoTime() - lastFrameAt >= streamIdleTimeoutMs * 1_000_000) {
+                throw RtspException("Camera stopped delivering video frames")
+            }
             val first = try {
                 input.read()
             } catch (_: SocketTimeoutException) {

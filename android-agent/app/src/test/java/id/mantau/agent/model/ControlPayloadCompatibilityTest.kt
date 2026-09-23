@@ -52,6 +52,8 @@ class ControlPayloadCompatibilityTest {
         assertEquals(fixture("agent_status.json").keySet(), status.keySet())
         assertEquals("android", status.getString("platform"))
         assertEquals(1, status.getInt("schema_version"))
+        assertEquals("degraded", status.getString("health_state"))
+        assertTrue(status.getString("health_explanation").contains("live view only"))
         val lowered = status.toString().lowercase()
         listOf("password", "agent_secret", "private_key", "rtsp://", "credentials")
             .forEach { assertFalse(lowered.contains(it)) }

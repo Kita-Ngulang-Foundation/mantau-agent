@@ -36,3 +36,12 @@ async def test_live_upload_failure_is_a_false_result(failure):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         uplink = FrameUplink("http://server", "agent", "secret", "cam", client=client)
         assert not await uplink.push(b"jpeg")
+
+
+async def test_oversize_frame_is_dropped_before_network_upload():
+    def handler(request):
+        pytest.fail('Oversize frame must not reach the network')
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        uplink = FrameUplink('http://server', 'agent', 'secret', 'cam', max_bytes=32, client=client)
+        assert uplink.encode(np.zeros((10, 10, 3), dtype=np.uint8)) is None
+        assert not await uplink.push(b'x' * 33)

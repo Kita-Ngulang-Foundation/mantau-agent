@@ -62,7 +62,7 @@ class AndroidH264JpegDecoder(
                 val jpeg = image?.use(::encode)
                 decoder.releaseOutputBuffer(outputIndex, false)
                 if (jpeg != null) return JpegFrame(
-                    jpeg.bytes, jpeg.width, jpeg.height, frame.capturedAt.toEpochMilli(),
+                    jpeg.bytes, jpeg.width, jpeg.height, info.presentationTimeUs / 1_000,
                 )
             } else if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 // Dimensions/crop are read from each output Image.

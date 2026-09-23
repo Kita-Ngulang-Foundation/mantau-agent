@@ -63,7 +63,7 @@ systemctl daemon-reload
 
 if [ ! -f "$CONFIG_PATH" ] && [ "$NO_SETUP" -eq 0 ]; then
     echo "Starting one-time enrollment and camera validation..."
-    runuser -u "$SERVICE_USER" -- "$INSTALL_PATH" --config "$CONFIG_PATH" setup
+    runuser -u "$SERVICE_USER" -- "$INSTALL_PATH" --config "$CONFIG_PATH" setup --remote
 fi
 
 if [ -f "$CONFIG_PATH" ]; then

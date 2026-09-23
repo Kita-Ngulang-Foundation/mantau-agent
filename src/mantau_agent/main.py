@@ -220,6 +220,7 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("run", help="run the monitoring service")
     setup = commands.add_parser("setup", help="enroll and select a validated camera")
+    setup.add_argument("--remote", action="store_true", help="enroll now; configure camera from Mantau app")
     setup.add_argument("--restore-backup", action="store_true",
                        help="restore the last known-good configuration before setup")
     status = commands.add_parser("status", help="show the last local health snapshot")
@@ -279,7 +280,7 @@ def cli(argv: list[str] | None = None) -> int:
             from .setup_wizard import run_wizard
             from .state import ConfigurationStore
             store = ConfigurationStore(args.config)
-            run_wizard(store)
+            run_wizard(store, remote=True) if args.remote else run_wizard(store)
             return 0
         if command == "status":
             status = StatusStore(settings.status_path).read() or {

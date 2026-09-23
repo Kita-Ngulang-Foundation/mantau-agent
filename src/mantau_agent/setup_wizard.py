@@ -27,6 +27,8 @@ ENV_PATH = Path(".env")
 def needs_setup(settings: Settings | None = None,
                 configuration: AgentConfiguration | None = None) -> bool:
     if configuration is not None:
+        if settings is not None and settings.command_channel_enabled and configuration.enrollment.agent_secret:
+            return False
         return configuration.setup_state is not SetupState.COMPLETE or configuration.camera is None
     s = settings or Settings()
     return not (s.agent_id and s.agent_secret and (s.camera_host or s.use_onvif_discovery))
@@ -44,6 +46,8 @@ def enroll(server_url: str, agent_id: str, *, client: httpx.Client | None = None
     try:
         resp = client.post(f"{server_url.rstrip('/')}/agents/enroll", json={"agent_id": agent_id})
         resp.raise_for_status()
+        if resp.json().get("claim_code"):
+            print(f"Claim code: {resp.json()['claim_code']}")
         return resp.json()["secret"]
     finally:
         if owns_client:
@@ -160,7 +164,7 @@ _NON_INTERACTIVE_MESSAGE = (
 )
 
 
-def run_wizard(store: ConfigurationStore | None = None) -> AgentConfiguration:
+def run_wizard(store: ConfigurationStore | None = None, *, remote: bool = False) -> AgentConfiguration:
     store = store or ConfigurationStore()
     if not sys.stdin.isatty():
         raise RuntimeError(_NON_INTERACTIVE_MESSAGE)
@@ -184,6 +188,10 @@ def run_wizard(store: ConfigurationStore | None = None) -> AgentConfiguration:
                 setup_state=SetupState.ENROLLED, enrollment=enrollment,
                 inference_mode=InferenceMode.AUTO,
             ))
+        if remote:
+            configuration = existing or store.load()
+            print("Enter the claim code in Mantau app, then start `mantau-agent run` to finish camera setup from the phone.")
+            return configuration
         camera = asyncio.run(_pick_camera_interactive(enrollment.agent_id))
         while True:
             raw_mode = _prompt("Inference mode (AUTO/EDGE/CLOUD/HYBRID)", default="AUTO").upper()

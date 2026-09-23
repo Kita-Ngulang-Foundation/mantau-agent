@@ -92,6 +92,26 @@ def test_enroll_returns_the_secret_from_a_successful_response():
     assert secret == "fresh-secret"
 
 
+def test_remote_enrollment_displays_claim_without_secret(monkeypatch, tmp_path, capsys):
+    store = ConfigurationStore(tmp_path / 'config.json')
+    monkeypatch.setattr(wizard.sys.stdin, 'isatty', lambda: True)
+    answers = iter(['https://server', 'agent-remote'])
+    monkeypatch.setattr('builtins.input', lambda prompt: next(answers))
+    client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(201, json={
+        'secret': 'private-agent-value', 'claim_code': 'CLAIM123',
+    })))
+    monkeypatch.setattr(wizard, 'enroll', lambda url, agent: enroll(url, agent, client=client))
+    configuration = wizard.run_wizard(store, remote=True)
+    from mantau_agent.config import load_settings
+    settings, saved = load_settings(store.path)
+    assert configuration.camera is None
+    assert settings.command_channel_enabled
+    assert not needs_setup(settings, saved)
+    output = capsys.readouterr().out
+    assert 'CLAIM123' in output
+    assert 'private-agent-value' not in output
+
+
 def test_enroll_raises_on_an_http_error_instead_of_returning_garbage():
     def handler(request):
         return httpx.Response(500, json={"detail": "boom"})

@@ -48,7 +48,7 @@ class Settings(CoreSettings):
     detector_backend: str = "null"       # "null" | "mediapipe"
     inference_mode: InferenceMode = InferenceMode.AUTO
     detection_fps: float = Field(default=5.0, gt=0, allow_inf_nan=False)
-    cloud_upload_fps: float = Field(default=1.0, gt=0, allow_inf_nan=False)
+    cloud_upload_fps: float = Field(default=1.0, gt=0, le=2.0, allow_inf_nan=False)
     hybrid_confirmation_fps: float = Field(default=0.2, gt=0, allow_inf_nan=False)
     frame_queue_size: int = Field(default=2, ge=1)
     upload_timeout_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)
