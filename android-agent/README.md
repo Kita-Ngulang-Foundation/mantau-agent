@@ -36,8 +36,13 @@ The bundled files in `app/src/main/assets/mantau/` are checked against
 mantau-core's pinned manifest (size + SHA-256) before loading; if any check or
 runtime load fails, EDGE is not advertised and the reason is reported. Events
 carry the same fields and signal names as the Python agent's and pass through
-the existing cooldown/deduplication gate. Unlike the Python agent there is no
-motion gate: pose runs on every frame the inference loop takes.
+the existing cooldown/deduplication gate. Pose tracks every frame the inference
+loop takes while the scene moves; after 3 s without motion `IdleGate` switches to
+a stateless image-mode check twice a second (like the Python agent's idle
+keepalive), so a still person keeps being observed and an emptied room reads as
+empty. The activity rules (`activity/`: prolonged position, nocturnal movement,
+bathroom duration) are a Kotlin port of mantau-core's, run on the same
+observations and configured by the same DetectionSettings JSON.
 
 HYBRID sends local events immediately plus one confirmation frame per event
 (five-second minimum interval) with the event id; the server's answer is stored
@@ -157,10 +162,16 @@ and inference-mode transitions. `FallParityTest` replays mantau-core's recorded
 pose sequences (copied into `src/test/resources/pose_sequences`) through the
 Kotlin rules and the real ONNX model and requires the exact per-frame decisions
 the Python rules recorded; `ModelAssetsTest` checks the bundled models and
-fixture copies against mantau-core.
+fixture copies against mantau-core. `ObservationParityTest` and
+`ActivityParityTest` replay mantau-core's observation and activity fixtures
+(`src/test/resources/activity_sequences`) and require exactly the events the
+Python rules produce.
 
 `connectedDebugAndroidTest` runs the real MediaPipe + ONNX Runtime path on a
 device or emulator. Generate its frames first with
-`scripts/prepare-instrumentation-frames.sh` (third-party footage, not committed). Real ONVIF cameras, MediaCodec/vendor RTSP
+`scripts/prepare-instrumentation-frames.sh` (third-party footage, not committed).
+`StagedScenesTest` replays scenes staged by `integration/stage_activity_clips.py`
+(pass `e2eScene` and base64 `e2eSettings`; with `e2eServer` and agent
+credentials it also posts the signed events to a running server). Real ONVIF cameras, MediaCodec/vendor RTSP
 variants, device power management, and control-plane integration still require
 hardware testing on the target phone and LAN.

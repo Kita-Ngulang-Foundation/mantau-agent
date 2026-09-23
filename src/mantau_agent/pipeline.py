@@ -78,7 +78,13 @@ class MonitoringPipeline:
                 raise
 
     async def _capture(self) -> None:
+        was_reachable = False
         while not self._stop.is_set():
+            reachable = bool(getattr(self.puller, "reachable", True))
+            if was_reachable and not reachable:
+                # Activity timers pause across the outage instead of counting it.
+                self.router.activity.camera_lost()
+            was_reachable = reachable
             frame = self.puller.latest_frame()
             if frame is not None:
                 self.router.submit(*frame)

@@ -1,5 +1,6 @@
 package id.mantau.agent.inference
 
+import id.mantau.agent.inference.fall.PersonObservation
 import id.mantau.agent.uplink.JpegFrame
 
 data class DetectorAvailability(
@@ -14,11 +15,22 @@ data class DetectionCandidate(
     val signals: Map<String, Double> = emptyMap(),
 )
 
+/**
+ * One frame's result: fall candidates plus who is where for the activity rules.
+ * [people] is null when nothing is known about this frame (it was skipped), which is
+ * different from an empty list (pose ran and saw nobody).
+ */
+data class FramePerception(
+    val candidates: List<DetectionCandidate>,
+    val people: List<PersonObservation>?,
+)
+
 interface MobileDetector : AutoCloseable {
     val backend: String
     val availability: DetectorAvailability
     fun benchmarkLatencyMs(): Double
-    fun detect(frame: JpegFrame): List<DetectionCandidate>
+    fun detect(frame: JpegFrame): List<DetectionCandidate> = perceive(frame).candidates
+    fun perceive(frame: JpegFrame): FramePerception
     override fun close() {}
 }
 
@@ -32,6 +44,6 @@ class UnavailableMobileDetector : MobileDetector {
     )
 
     override fun benchmarkLatencyMs(): Double = error(availability.reason)
-    override fun detect(frame: JpegFrame): List<DetectionCandidate> = emptyList()
+    override fun perceive(frame: JpegFrame) = FramePerception(emptyList(), null)
 }
 

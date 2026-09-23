@@ -59,7 +59,7 @@ class DurableEnvelopeQueue(
         evictExpired()
         if (depth() >= maxItems) evictOldestHeartbeat()
         check(depth() < maxItems) { "Durable event queue is full; no event was discarded" }
-        AtomicFiles.write(file(envelope.sequence), envelope.toJson().toString().toByteArray(Charsets.UTF_8))
+        AtomicFiles.write(file(envelope.sequence), CanonicalJson.encode(envelope.toJson()))
     }
 
     @Synchronized
