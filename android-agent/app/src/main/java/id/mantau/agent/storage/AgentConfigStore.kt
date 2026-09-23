@@ -66,6 +66,20 @@ class AgentConfigStore(
         if (cameraPassword != null) secrets.put(CAMERA_PASSWORD, cameraPassword)
     }
 
+    /**
+     * Detection settings from the Mantau app, stored verbatim so they survive
+     * restarts. The activity rules that use them run in the shared Python
+     * engine; on Android they take effect once cloud inference is enabled.
+     */
+    fun saveDetectionSettings(settings: JSONObject) {
+        check(preferences.edit().putString("detection_settings", settings.toString()).commit()) {
+            "Could not persist detection settings"
+        }
+    }
+
+    fun detectionSettings(): JSONObject? =
+        preferences.getString("detection_settings", null)?.let(::JSONObject)
+
     fun agentSecret(): String? = secrets.get(AGENT_SECRET)
     fun cameraPassword(): String? = secrets.get(CAMERA_PASSWORD)
 

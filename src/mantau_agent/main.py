@@ -13,9 +13,12 @@ from contextlib import AsyncExitStack
 
 from mantau_core.buffer import DurableSpool
 from mantau_core.contracts import CameraRef, Credentials, StreamProfile
+from mantau_core.activity import ActivityEngine
 from mantau_core.detection import Detector, NullDetector
 from mantau_core.resilience import BackoffPolicy
 
+from .activity_rules import build_activity_rules
+from .clips import ClipRecorder, ClipUploader
 from . import __version__
 from .camera.puller import CameraPuller
 from .capabilities import InferenceMode, inspect_capabilities
@@ -138,8 +141,22 @@ async def build_pipeline(settings: Settings, *,
             max_width=settings.live_view_max_width,
         )
         cleanup.push_async_callback(frames.close)
+        stored = configuration_store.load() if configuration_store is not None else None
+        activity = ActivityEngine(
+            rules=build_activity_rules(),
+            settings=(stored.detection_settings if stored is not None else None),
+        )
+        clips = None
+        if settings.clips_enabled:
+            clips = ClipRecorder(
+                uploader=ClipUploader(settings.server_url, settings.agent_id,
+                                      settings.agent_secret),
+                encode_jpeg=frames.encode, spool_dir=settings.clip_spool_dir,
+                fps=settings.clip_fps, pre_s=settings.clip_pre_s, post_s=settings.clip_post_s,
+            )
         router = InferenceRouter(
             camera_id=settings.camera_id, detector=detector, event_uplink=uplink,
+            activity=activity, clips=clips,
             frame_uplink=frames, capabilities=capabilities, mode=settings.inference_mode,
             inference_uplink=inference_uplink,
             sampler=FrameSampler(keep_every_n=settings.sampler_keep_every_n,

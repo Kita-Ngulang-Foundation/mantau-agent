@@ -8,7 +8,8 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from mantau_core.detection import Detector, NullDetector
+from mantau_core.activity import ActivityEngine
+from mantau_core.detection import Detector, NullDetector, PerceivingDetector
 
 from ..capabilities import CapabilityReport, InferenceMode, select_inference_mode
 from ..uplink.frames import FrameUplink
@@ -40,6 +41,7 @@ class InferenceRouter:
                  cloud_upload_fps: float = 1.0, confirmation_fps: float = 0.2,
                  live_view_fps: float = 4.0, live_view_enabled: bool = True,
                  queue_size: int = 2, upload_timeout_s: float = 5.0,
+                 activity: ActivityEngine | None = None, clips=None,
                  clock: Callable[[], float] = time.monotonic) -> None:
         rates = (detection_fps, cloud_upload_fps, confirmation_fps, live_view_fps,
                  upload_timeout_s)
@@ -58,6 +60,10 @@ class InferenceRouter:
         self.live_view_fps = live_view_fps
         self.live_view_enabled = live_view_enabled
         self.upload_timeout_s = upload_timeout_s
+        # Rules for stillness, nocturnal movement, and bathroom duration run
+        # on observations from a perceiving detector.
+        self.activity = activity or ActivityEngine()
+        self.clips = clips
         self._clock = clock
         self._sampler = sampler or FrameSampler()
         self._detection_sampler = FrameSampler(max_fps=detection_fps)
@@ -97,6 +103,10 @@ class InferenceRouter:
             "dropped_frames": dict(self.dropped), "upload_failures": dict(self.upload_failures),
             "synthetic_events_suppressed": self.synthetic_events_suppressed,
             "last_error": self.last_error,
+            "detection_settings_version": self.activity.settings.version,
+            "activity_rules": [type(rule).__name__ for rule in self.activity.rules],
+            "activity_rule_failures": dict(self.activity.failures),
+            "clips": self.clips.health() if self.clips is not None else None,
         }
 
     async def start(self) -> None:
@@ -106,6 +116,8 @@ class InferenceRouter:
             if self._running:
                 return
             self._running = self._accepting = True
+            if self.clips is not None:
+                self.clips.start()
             self._tasks = [asyncio.create_task(self._worker(name), name=f"router-{name}")
                            for name in self._queues]
 
@@ -123,6 +135,12 @@ class InferenceRouter:
             return
         self._last_ts = ts_ms
         work = FrameWork(image, ts_ms)
+        if self.clips is not None:
+            try:
+                self.clips.add_frame(image, ts_ms)
+            except Exception as exc:  # noqa: BLE001 -- clips never block capture
+                self.last_error = f"clips: {type(exc).__name__}"
+
         if self.mode != InferenceMode.CLOUD:
             if self._sampler.should_keep(ts_ms) and self._detection_sampler.should_keep(ts_ms):
                 self._enqueue("detection", work)
@@ -156,7 +174,13 @@ class InferenceRouter:
     async def _detect(self, work: FrameWork) -> None:
         if self.detector is None:
             return
-        events = await asyncio.to_thread(self.detector.push, work.image, work.ts_ms)
+        if isinstance(self.detector, PerceivingDetector):
+            perception = await asyncio.to_thread(self.detector.perceive, work.image, work.ts_ms)
+            events = list(perception.events)
+            if perception.observation is not None:
+                events.extend(self.activity.update(perception.observation))
+        else:
+            events = await asyncio.to_thread(self.detector.push, work.image, work.ts_ms)
         self._detector_ok = not isinstance(self.detector, NullDetector)
         production = []
         for event in events:
@@ -165,6 +189,8 @@ class InferenceRouter:
                 continue
             await self.event_uplink.send_event(event)
             production.append(event.event_id)
+            if self.clips is not None:
+                self.clips.on_event(event)
         if (production and self.mode == InferenceMode.HYBRID
                 and self.inference_uplink is not None and self._accepting):
             self._enqueue("cloud", FrameWork(work.image, work.ts_ms, tuple(production)))
@@ -234,6 +260,8 @@ class InferenceRouter:
             try:
                 if self.detector is not None:
                     await asyncio.to_thread(self.detector.close)
+                if self.clips is not None:
+                    await self.clips.close()
             finally:
                 try:
                     await self.frame_uplink.close()

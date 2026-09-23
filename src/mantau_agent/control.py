@@ -11,7 +11,9 @@ from typing import Awaitable, Callable
 
 import httpx
 from cryptography.fernet import Fernet
+from pydantic import ValidationError
 from mantau_core.contracts import (
+    DetectionSettings,
     CameraRef, CommandFailureReason, CommandResult, CommandState, CommandType,
     ControlCommand, Credentials, StreamProfile,
 )
@@ -205,6 +207,20 @@ class CommandExecutor:
         if command.command_type in (CommandType.RESTART, CommandType.RECONFIGURE):
             self.restart_requested()
             return {"restart_requested": True}, "Service restart requested."
+        if command.command_type is CommandType.APPLY_DETECTION_SETTINGS:
+            camera_id = command.payload.get("camera_id")
+            if camera_id != self.settings.camera_id:
+                raise CameraCommandError(CommandFailureReason.INVALID_REQUEST)
+            try:
+                settings = DetectionSettings.model_validate(command.payload.get("settings"))
+            except ValidationError as exc:
+                raise CameraCommandError(CommandFailureReason.INVALID_REQUEST) from exc
+            self.pipeline.router.activity.apply_settings(settings)
+            current = self.config_store.load()
+            if current is not None:
+                self.config_store.save(current.model_copy(update={"detection_settings": settings}))
+            return ({"camera_id": camera_id, "detection_settings_version": settings.version},
+                    "Detection settings applied.")
         raise ValueError("unsupported command")
 
     def _camera(self, payload: dict) -> CameraRef:

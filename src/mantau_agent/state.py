@@ -8,6 +8,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal
 
+from mantau_core.contracts import DetectionSettings
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .capabilities import InferenceMode
@@ -48,6 +49,8 @@ class AgentConfiguration(BaseModel):
     enrollment: EnrollmentConfiguration
     camera: CameraConfiguration | None = None
     inference_mode: InferenceMode = InferenceMode.AUTO
+    # Last settings the app applied; None means defaults.
+    detection_settings: DetectionSettings | None = None
 
     def settings_data(self) -> dict:
         values = {

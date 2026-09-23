@@ -61,6 +61,12 @@ class Settings(CoreSettings):
     poll_interval_s: float = Field(default=0.02, gt=0, allow_inf_nan=False)
 
     # -- live view ---------------------------------------------------------------
+    # Review clips around events (never for bathroom-duration events).
+    clips_enabled: bool = True
+    clip_fps: float = Field(default=5.0, gt=0, le=15, allow_inf_nan=False)
+    clip_pre_s: float = Field(default=5.0, ge=1, le=30)
+    clip_post_s: float = Field(default=5.0, ge=1, le=30)
+    clip_spool_dir: str = "data/clips"
     live_view_enabled: bool = True
     live_view_fps: float = Field(default=4.0, gt=0, allow_inf_nan=False)
     live_view_jpeg_quality: int = 70

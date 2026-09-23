@@ -14,6 +14,7 @@ import id.mantau.agent.inference.UnavailableMobileDetector
 import id.mantau.agent.model.AgentConfig
 import id.mantau.agent.model.CameraConfig
 import id.mantau.agent.model.CameraConnectivity
+import id.mantau.agent.model.DetectionSettingsPayload
 import id.mantau.agent.model.CommandResult
 import id.mantau.agent.model.ControlCommand
 import id.mantau.agent.model.HealthState
@@ -408,6 +409,19 @@ class MonitoringEngine(
             CommandResult(
                 command.commandId, "succeeded", message = "Android monitoring session restarted.",
                 data = JSONObject().put("restart_requested", true),
+            )
+        }
+        "apply_detection_settings" -> {
+            val settings = DetectionSettingsPayload.parse(
+                command.payload,
+                expectedCameraId = configStore.load().camera?.cameraId,
+            )
+            configStore.saveDetectionSettings(settings.raw)
+            CommandResult(
+                command.commandId, "succeeded", message = "Detection settings stored.",
+                data = JSONObject()
+                    .put("camera_id", settings.cameraId)
+                    .put("detection_settings_version", settings.version),
             )
         }
         else -> throw UnsupportedOperationException("Unsupported command")
