@@ -271,6 +271,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mantau-agent")
     parser.add_argument("--config", help="durable configuration path")
     parser.add_argument("--status-path", help="local health snapshot path")
+    parser.add_argument("--server-url", help="override the configured server URL for this invocation")
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("run", help="run the monitoring service")
     setup = commands.add_parser("setup", help="enroll and select a validated camera")
@@ -358,6 +359,8 @@ def cli(argv: list[str] | None = None) -> int:
         settings, configuration = load_settings(args.config)
         if args.status_path:
             settings.status_path = args.status_path
+        if args.server_url:
+            settings.server_url = args.server_url
         logging.basicConfig(level=settings.log_level)
         if command == "setup":
             from .setup_wizard import run_wizard

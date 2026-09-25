@@ -32,6 +32,24 @@ def test_status_path_cli_option_reads_installed_snapshot(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["marker"] == "installed"
 
 
+def test_server_url_cli_option_overrides_runtime_settings(monkeypatch, tmp_path, capsys):
+    seen = []
+
+    async def discover(settings):
+        seen.append(settings.server_url)
+        return []
+
+    monkeypatch.setattr(main, "_discover_command", discover)
+    code = main.cli([
+        "--config", str(tmp_path / "missing.json"),
+        "--server-url", "https://mantau.example", "discover", "--json",
+    ])
+
+    assert code == 0
+    assert seen == ["https://mantau.example"]
+    assert json.loads(capsys.readouterr().out) == []
+
+
 def test_status_json_never_contains_configuration_secrets(monkeypatch, tmp_path, capsys):
     path = tmp_path / "status.json"
     StatusStore(path).write({
