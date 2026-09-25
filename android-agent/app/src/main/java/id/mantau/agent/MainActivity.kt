@@ -151,7 +151,7 @@ class MainActivity : Activity() {
 
     private fun loadUi() {
         val config = store.load()
-        server.setText(config.serverUrl.ifBlank { "http://192.168.1.2:8100" })
+        server.setText(config.serverUrl.ifBlank { BuildConfig.DEFAULT_SERVER_URL })
         agentId.text = "Agent ID: ${config.agentId}"
         agentName.setText(config.name)
         claimCode.text = config.claimCode?.let { "Claim code: $it" } ?: "Not enrolled"
