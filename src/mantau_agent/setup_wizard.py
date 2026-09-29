@@ -245,20 +245,15 @@ def run_wizard(store: ConfigurationStore | None = None, *, remote: bool = False)
                 server_url=server_url, agent_id=agent_id, agent_secret=secret)
             store.save(AgentConfiguration(
                 setup_state=SetupState.ENROLLED, enrollment=enrollment,
-                inference_mode=InferenceMode.AUTO,
+                inference_mode=InferenceMode.CLOUD,
             ))
         if remote:
             configuration = existing or store.load()
             print("Enter the claim code in Mantau app, then start `mantau-agent run` to finish camera setup from the phone.")
             return configuration
         camera = asyncio.run(_pick_camera_interactive(enrollment.agent_id))
-        while True:
-            raw_mode = _prompt("Inference mode (AUTO/EDGE/CLOUD/HYBRID)", default="AUTO").upper()
-            try:
-                inference_mode = InferenceMode(raw_mode)
-                break
-            except ValueError:
-                print("Choose AUTO, EDGE, CLOUD, or HYBRID.")
+        inference_mode = InferenceMode.CLOUD
+        print("Inference runs on the Mantau server (CLOUD).")
     except (EOFError, KeyboardInterrupt) as exc:
         raise RuntimeError("Setup cancelled; saved enrollment can be resumed") from exc
     configuration = AgentConfiguration(

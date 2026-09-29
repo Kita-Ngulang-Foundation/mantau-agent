@@ -202,7 +202,7 @@ def test_enrollment_failure_does_not_expose_http_error_details(monkeypatch, tmp_
 def test_completed_setup_persists_camera_and_inference_mode(monkeypatch, tmp_path):
     store = ConfigurationStore(tmp_path / "config.json")
     monkeypatch.setattr(wizard.sys.stdin, "isatty", lambda: True)
-    answers = iter(["https://server", "agent-one", "HYBRID"])
+    answers = iter(["https://server", "agent-one"])
     monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
     monkeypatch.setattr(wizard, "enroll", lambda *args: "agent-secret")
 
@@ -213,7 +213,7 @@ def test_completed_setup_persists_camera_and_inference_mode(monkeypatch, tmp_pat
     monkeypatch.setattr(wizard, "_pick_camera_interactive", selected)
     completed = wizard.run_wizard(store)
     assert completed.setup_state is SetupState.COMPLETE
-    assert completed.inference_mode is InferenceMode.HYBRID
+    assert completed.inference_mode is InferenceMode.CLOUD
     assert store.load().camera.host == "192.0.2.20"
 
 

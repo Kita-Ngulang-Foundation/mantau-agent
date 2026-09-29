@@ -36,7 +36,7 @@ class AgentConfigStore(
                     username = it.optString("username").takeIf(String::isNotBlank),
                 )
             },
-            requestedInferenceMode = json.optString("requested_inference_mode", "AUTO"),
+            requestedInferenceMode = json.optString("requested_inference_mode", "CLOUD"),
         ).also { it.validate() }
     }
 

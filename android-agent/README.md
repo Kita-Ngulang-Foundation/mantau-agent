@@ -12,14 +12,15 @@ The Android agent uses the existing v1 control contracts and endpoints:
 - durable command results: `POST /agent-control/commands/{id}/results`;
 - `platform` is always `android` in status and capability reports.
 
-The agent benchmarks architecture, memory, Android GPU/NNAPI API availability,
-detector availability/latency, and thermal state. It maps those facts into the
-existing v1 capability fields and reports the selected mode and explanation in
-the existing status/health fields. It does not add Android-only wire fields.
+The agent reports architecture, memory, Android GPU/NNAPI API availability,
+thermal state, and server inference availability through the existing v1
+capability fields. It does not initialize or benchmark an on-device model.
 
-Advertised modes are the ones that can run: EDGE when the detector loaded and
-benchmarked, CLOUD when the server's `GET /inference/capability` says it runs the
-detector (re-read every heartbeat), HYBRID with both. CLOUD decodes the RTSP
+The runtime uses CLOUD only; old saved EDGE/HYBRID choices are migrated to
+CLOUD at service start. Capability reports advertise CLOUD when the server's
+`GET /inference/capability` says inference is available (re-read every
+heartbeat). AUTO is retained for protocol compatibility and also uses CLOUD.
+CLOUD decodes the RTSP
 H.264 substream locally and sends signed JPEGs to `POST /agents/{id}/inference`
 (`uplink/InferenceUplink.kt`, the same contract and golden signature as the
 Python agent) at 10 fps capped by the server's `max_fps`; the server runs the
@@ -28,30 +29,11 @@ fall detector and stores/pushes falls under this agent. Live view keeps its own
 most, refused above the server's size limit, retried once on a network/5xx
 error with the same frame id, dropped once stale, and never spooled.
 
-EDGE runs on the phone (`inference/fall/`): MediaPipe Tasks Pose Landmarker
-(`pose_landmarker_lite.task`, Apache-2.0), a Kotlin port of mantau-AI's fall
-rules (tracker, fall state machine, window features), and the same
-`fall_classifier.onnx` the Python agent runs, through ONNX Runtime for Android.
-The bundled files in `app/src/main/assets/mantau/` are checked against
-mantau-core's pinned manifest (size + SHA-256) before loading; if any check or
-runtime load fails, EDGE is not advertised and the reason is reported. Events
-carry the same fields and signal names as the Python agent's and pass through
-the existing cooldown/deduplication gate. Pose tracks every frame the inference
-loop takes while the scene moves; after 3 s without motion `IdleGate` switches to
-a stateless image-mode check twice a second (like the Python agent's idle
-keepalive), so a still person keeps being observed and an emptied room reads as
-empty. The activity rules (`activity/`: prolonged position, nocturnal movement,
-bathroom duration) are a Kotlin port of mantau-core's, run on the same
-observations and configured by the same DetectionSettings JSON.
-
-HYBRID sends local events immediately plus one confirmation frame per event
-(five-second minimum interval) with the event id; the server's answer is stored
-on the event. AUTO selects EDGE when the detector loaded and its benchmark keeps
-at least 10 fps; otherwise CLOUD when the server offers inference, else the
-slower EDGE. Explicit modes fall back to what can run: EDGE with a model that
-failed to load goes to CLOUD, CLOUD/HYBRID without server inference go to EDGE,
-and a detector that fails while running hands over to CLOUD. Only when nothing
-can run does selection fail, with the reason in status.
+The local fall detector, activity engine, and shared parity tests remain in
+source, but the monitoring service does not load or call them. If server
+inference is unavailable, monitoring reports degraded health and drops
+inference frames until the server is reachable again. The camera connection,
+control channel, heartbeat, and live-view path continue to operate.
 
 ## Build
 

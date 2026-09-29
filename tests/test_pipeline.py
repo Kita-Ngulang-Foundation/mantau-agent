@@ -42,19 +42,26 @@ async def pipeline_factory(monkeypatch, tmp_path):
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         monkeypatch.setattr(main, "CameraPuller", Puller)
-        # No server here: capability discovery answers "no server inference".
+        # Tests inject a server-inference transport without external networking.
         async def no_capability(*args, **kwargs):
             return None
         monkeypatch.setattr(main, "discover_capability", no_capability)
         monkeypatch.setattr(main, "UplinkClient", lambda *a, **k: UplinkClient(*a, **k, client=client))
         monkeypatch.setattr(main, "FrameUplink", lambda *a, **k: FrameUplink(*a, **k, client=client))
 
+        class Cloud:
+            async def submit(self, jpeg, **metadata):
+                return True
+
+            async def close(self):
+                pass
+
         async def create(inference_uplink=None, **overrides):
             settings = Settings(agent_id="agent", agent_secret="secret", camera_host="localhost",
                                 seq_path=str(tmp_path / "seq"), spool_path=str(tmp_path / "spool.db"),
                                 status_path=str(tmp_path / "status.json"),
                                 poll_interval_s=.001, heartbeat_interval_s=.02, **overrides)
-            pipeline = await main.build_pipeline(settings, inference_uplink=inference_uplink)
+            pipeline = await main.build_pipeline(settings, inference_uplink=inference_uplink or Cloud())
             pipelines.append(pipeline)
             return pipeline, calls
 
@@ -64,22 +71,26 @@ async def pipeline_factory(monkeypatch, tmp_path):
 
 
 async def test_pipeline_starts_captures_reports_truthful_health_and_shuts_down(pipeline_factory):
-    pipeline, calls = await pipeline_factory(inference_mode=Mode.EDGE, null_detector_trigger_every=1)
+    pipeline, calls = await pipeline_factory(inference_mode=Mode.EDGE,
+                                             null_detector_trigger_every=1,
+                                             live_view_enabled=False)
     await pipeline.start()
     await pipeline.start()
     for _ in range(100):
-        if pipeline.router.synthetic_events_suppressed and calls:
+        if calls:
             break
         await asyncio.sleep(.005)
     assert pipeline.puller.started == 1
-    assert pipeline.router.synthetic_events_suppressed == 1
+    assert pipeline.router.synthetic_events_suppressed == 0
+    assert pipeline.router.mode == Mode.CLOUD
+    assert pipeline.router.detector is None
     assert all(request.url.path == "/ingest" for request in calls)
     heartbeats = [json.loads(request.content) for request in calls]
     assert heartbeats and all(h["kind"] == "heartbeat" for h in heartbeats)
     assert all(not h["payload"]["detector_alive"] for h in heartbeats)
     assert pipeline.health()["capabilities"]["detector_backend"] == "null"
     await pipeline.change_mode(Mode.CLOUD)
-    assert pipeline.health()["routing"]["degraded"]
+    assert not pipeline.health()["routing"]["degraded"]
     await asyncio.wait_for(pipeline.shutdown(), .5)
     await pipeline.shutdown()
     assert pipeline.puller.stopped == 1
@@ -115,13 +126,13 @@ async def test_failed_start_cleans_up_every_component(pipeline_factory):
     await pipeline.shutdown()
 
 
-async def test_auto_missing_mediapipe_degrades_without_creating_synthetic_detector(
+async def test_configured_mediapipe_is_not_loaded(
         pipeline_factory, monkeypatch):
     monkeypatch.setitem(sys.modules, "mantau.api.streaming", None)
     pipeline, _ = await pipeline_factory(detector_backend="mediapipe", inference_mode=Mode.AUTO)
     assert pipeline.router.mode == Mode.CLOUD
     assert pipeline.router.detector is None
-    assert pipeline.router.capabilities.detector_error
+    assert pipeline.router.capabilities.detector_backend == "null"
 
 
 async def test_explicit_cloud_does_not_construct_local_detector(pipeline_factory, monkeypatch):

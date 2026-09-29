@@ -30,7 +30,7 @@ data class AgentConfig(
     val name: String = agentId,
     val claimCode: String? = null,
     val camera: CameraConfig? = null,
-    val requestedInferenceMode: String = "AUTO",
+    val requestedInferenceMode: String = "CLOUD",
 ) {
     fun validate(requireCamera: Boolean = false) {
         require(agentId.matches(Regex("[A-Za-z0-9._-]{3,128}"))) { "Agent ID is invalid" }
