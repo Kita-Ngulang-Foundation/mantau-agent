@@ -45,12 +45,12 @@ class Settings(CoreSettings):
     default_stream_profile: str = "sub"  # "sub" | "main"
 
     # -- detection -------------------------------------------------------------
-    detector_backend: str = "null"       # "null" | "mediapipe"
+    detector_backend: str = "null"       # Retained for existing configs; runtime uses server inference.
     # Directory holding the pinned model files (see mantau_core.detection.
     # artifacts); empty = the models packaged with the installed mantau-AI.
     model_dir: str = ""
     fall_classifier_enabled: bool = True
-    inference_mode: InferenceMode = InferenceMode.AUTO
+    inference_mode: InferenceMode = InferenceMode.CLOUD
     # 15 fps matched full-frame-rate accuracy on the UR Fall and Y-B-Class clips;
     # at 5-10 fps the tracker loses the person mid-fall and recall drops.
     detection_fps: float = Field(default=15.0, gt=0, allow_inf_nan=False)

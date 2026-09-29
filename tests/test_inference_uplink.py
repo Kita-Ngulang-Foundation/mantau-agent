@@ -237,42 +237,37 @@ class _Detector:
         pass
 
 
-@pytest.mark.parametrize("requested", [Mode.AUTO, Mode.EDGE, Mode.HYBRID])
-async def test_edge_model_that_fails_to_load_falls_back_to_cloud(build, requested):
-    from mantau_core.detection.artifacts import ArtifactError
-    pipeline = await build(detector_error=ArtifactError("model artifact does not match"),
+@pytest.mark.parametrize("requested", list(Mode))
+async def test_configured_local_mode_never_loads_local_model(build, requested):
+    pipeline = await build(detector_error=AssertionError("local model was loaded"),
                            inference_mode=requested)
     router = pipeline.router
     assert router.mode == Mode.CLOUD
     assert isinstance(router.inference_uplink, HttpInferenceUplink)
     assert router.detector is None
-    assert "ArtifactError" in router.capabilities.detector_error
+    assert router.capabilities.detector_backend == "null"
     assert router.capabilities.supported_inference_modes == [Mode.AUTO, Mode.CLOUD]
 
 
-async def test_edge_model_that_benchmarks_too_slow_falls_back_to_cloud(build):
+async def test_local_throughput_is_ignored(build):
     pipeline = await build(detector=_Detector(fps=2.0), inference_mode=Mode.AUTO,
                            detection_fps=15.0)
     assert pipeline.router.mode == Mode.CLOUD
-    assert "throughput" in pipeline.router.selection.reason
+    assert pipeline.router.detector is None
     assert pipeline.router.cloud_upload_fps == 10.0
 
 
-async def test_fast_edge_model_stays_on_device_with_cloud_available(build):
+async def test_fast_edge_model_is_not_selected(build):
     pipeline = await build(detector=_Detector(fps=40.0), inference_mode=Mode.AUTO)
-    assert pipeline.router.mode == Mode.EDGE
-    assert Mode.HYBRID in pipeline.router.capabilities.supported_inference_modes
+    assert pipeline.router.mode == Mode.CLOUD
+    assert Mode.HYBRID not in pipeline.router.capabilities.supported_inference_modes
 
 
-async def test_without_server_inference_a_broken_edge_model_stays_visible(build):
+@pytest.mark.parametrize("requested", list(Mode))
+async def test_without_server_inference_startup_fails_closed(build, requested):
     unavailable = CAPABILITY.model_copy(update={"available": False, "reason": "disabled"})
-    pipeline = await build(capability=unavailable, detector_error=RuntimeError("x"),
-                           inference_mode=Mode.AUTO)
-    assert pipeline.router.inference_uplink is None
-    assert pipeline.router.health()["degraded"]
-    with pytest.raises(RuntimeError):
-        await build(capability=unavailable, detector_error=RuntimeError("x"),
-                    inference_mode=Mode.EDGE)
+    with pytest.raises(RuntimeError, match="Server inference unavailable"):
+        await build(capability=unavailable, inference_mode=requested)
 
 
 async def test_server_rate_caps_the_cloud_upload_rate(build):

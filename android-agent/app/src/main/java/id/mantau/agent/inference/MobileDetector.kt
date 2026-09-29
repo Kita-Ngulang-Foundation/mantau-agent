@@ -34,6 +34,14 @@ interface MobileDetector : AutoCloseable {
     override fun close() {}
 }
 
+/** Capability probe for builds that send frames to server inference only. */
+class ServerOnlyDetector : MobileDetector {
+    override val backend = "server"
+    override val availability = DetectorAvailability(false, "On-device inference is disabled.")
+    override fun benchmarkLatencyMs(): Double = error(availability.reason)
+    override fun perceive(frame: JpegFrame): FramePerception = error(availability.reason)
+}
+
 class UnavailableMobileDetector : MobileDetector {
     override val backend = "unavailable"
     override val availability = DetectorAvailability(
