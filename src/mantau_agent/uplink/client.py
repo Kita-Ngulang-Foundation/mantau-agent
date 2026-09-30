@@ -10,7 +10,7 @@ import asyncio
 from datetime import datetime, timezone
 
 import httpx
-from mantau_core.contracts import Envelope, FallEvent, Heartbeat
+from mantau_core.contracts import Envelope, Heartbeat
 
 from .seq import SeqCounter
 from .spool import EnvelopeSpool
@@ -39,10 +39,6 @@ class UplinkClient:
         self.server_reachable = False
         self.last_successful_contact: datetime | None = None
         self.last_error: str | None = None
-
-    async def send_event(self, event: FallEvent) -> None:
-        envelope = Envelope.for_event(self.agent_id, self._seq.next(), event).sign(self._secret)
-        await self._send_or_spool(envelope)
 
     async def send_heartbeat(self, heartbeat: Heartbeat) -> None:
         envelope = Envelope.for_heartbeat(self.agent_id, self._seq.next(), heartbeat).sign(self._secret)

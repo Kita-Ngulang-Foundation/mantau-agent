@@ -268,7 +268,10 @@ There is no local fallback. When the server offers no inference, the agent
 detects nothing: health reports `degraded` with the reason "server inference
 unavailable", the heartbeat reports no detector, and the agent asks the server
 again every `MANTAU_INFERENCE_PROBE_INTERVAL_S`; once the server offers
-inference, the service restarts and uploads again. Capability reports list
+inference, the process exits so its supervisor restarts it, and it uploads
+again. The systemd unit's `Restart=always` does this; in Docker, run the
+container with a restart policy (for example `docker run --restart
+unless-stopped`), or it stays stopped. Capability reports list
 `AUTO` and `CLOUD` as supported and recommend `CLOUD`. Settings of the removed
 on-device detector (`MANTAU_DETECTOR_BACKEND`, `MANTAU_MODEL_DIR`,
 `MANTAU_FALL_CLASSIFIER_ENABLED`, `MANTAU_DETECTION_FPS`,

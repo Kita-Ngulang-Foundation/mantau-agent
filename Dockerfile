@@ -2,6 +2,9 @@
 # sibling), e.g.: docker build -f Dockerfile -t mantau-agent ..
 # Needs the mantau-core sibling checkout. The agent runs no detector: it
 # uploads frames and the server runs fall detection (CLOUD only).
+# Run it with a restart policy (e.g. `docker run --restart unless-stopped`):
+# when server inference comes back after an outage, the agent exits so its
+# supervisor restarts it with the inference uplink.
 # Builds for linux/amd64 and linux/arm64 alike, e.g.:
 #   docker buildx build --platform linux/arm64 -f mantau-agent/Dockerfile .
 #
