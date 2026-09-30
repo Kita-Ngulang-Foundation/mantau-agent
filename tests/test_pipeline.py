@@ -1,6 +1,5 @@
 import asyncio
 import json
-import sys
 
 import httpx
 import numpy as np
@@ -64,20 +63,20 @@ async def pipeline_factory(monkeypatch, tmp_path):
 
 
 async def test_pipeline_starts_captures_reports_truthful_health_and_shuts_down(pipeline_factory):
-    pipeline, calls = await pipeline_factory(inference_mode=Mode.EDGE, null_detector_trigger_every=1)
+    # A stored EDGE mode still loads and runs as CLOUD.
+    pipeline, calls = await pipeline_factory(inference_mode=Mode.EDGE, live_view_enabled=False)
     await pipeline.start()
     await pipeline.start()
     for _ in range(100):
-        if pipeline.router.synthetic_events_suppressed and calls:
+        if calls:
             break
         await asyncio.sleep(.005)
     assert pipeline.puller.started == 1
-    assert pipeline.router.synthetic_events_suppressed == 1
     assert all(request.url.path == "/ingest" for request in calls)
     heartbeats = [json.loads(request.content) for request in calls]
     assert heartbeats and all(h["kind"] == "heartbeat" for h in heartbeats)
     assert all(not h["payload"]["detector_alive"] for h in heartbeats)
-    assert pipeline.health()["capabilities"]["detector_backend"] == "null"
+    assert pipeline.health()["effective_inference_mode"] == "CLOUD"
     await pipeline.change_mode(Mode.CLOUD)
     assert pipeline.health()["routing"]["degraded"]
     await asyncio.wait_for(pipeline.shutdown(), .5)
@@ -115,19 +114,7 @@ async def test_failed_start_cleans_up_every_component(pipeline_factory):
     await pipeline.shutdown()
 
 
-async def test_auto_missing_mediapipe_degrades_without_creating_synthetic_detector(
-        pipeline_factory, monkeypatch):
-    monkeypatch.setitem(sys.modules, "mantau.api.streaming", None)
-    pipeline, _ = await pipeline_factory(detector_backend="mediapipe", inference_mode=Mode.AUTO)
-    assert pipeline.router.mode == Mode.CLOUD
-    assert pipeline.router.detector is None
-    assert pipeline.router.capabilities.detector_error
-
-
-async def test_explicit_cloud_does_not_construct_local_detector(pipeline_factory, monkeypatch):
-    def forbidden(*args):
-        raise AssertionError("CLOUD must not load a local model")
-
+async def test_explicit_cloud_routes_to_server_inference(pipeline_factory):
     class Cloud:
         async def submit(self, jpeg, **metadata):
             return True
@@ -135,10 +122,8 @@ async def test_explicit_cloud_does_not_construct_local_detector(pipeline_factory
         async def close(self):
             pass
 
-    monkeypatch.setattr(main, "_build_detector", forbidden)
-    pipeline, _ = await pipeline_factory(inference_mode=Mode.CLOUD, detector_backend="mediapipe",
-                                         inference_uplink=Cloud())
-    assert pipeline.router.detector is None
+    pipeline, _ = await pipeline_factory(inference_mode=Mode.CLOUD, inference_uplink=Cloud())
+    assert not pipeline.router.detector_alive
     assert pipeline.router.mode == Mode.CLOUD
 
 

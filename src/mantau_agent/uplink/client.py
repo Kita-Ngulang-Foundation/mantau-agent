@@ -1,8 +1,7 @@
 """Build an envelope, try to send it, spool it on failure, drain the spool
 whenever a send succeeds. Never raises past this module's boundary --
-`detect/runner.py`'s `on_event` and the heartbeat loop fire-and-forget into
-`send_event`/`send_heartbeat`; a fall event that can't reach the server yet
-must never crash the detection loop that found it.
+the heartbeat loop fires and forgets into `send_heartbeat`, and an envelope
+that can't reach the server yet must never crash the loop that sent it.
 """
 
 from __future__ import annotations

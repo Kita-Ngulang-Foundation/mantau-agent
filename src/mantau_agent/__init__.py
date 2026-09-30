@@ -6,7 +6,7 @@ customer and the internet.
 
     discovery/  find the camera on the LAN: ONVIF WS-Discovery, or a manual IP
     camera/     the RTSP handshake, SDP-based stream inspection, frame pulling
-    detect/     frame decimation + the mantau_core Detector protocol
+    detect/     frame decimation and routing of sampled frames to server inference
     uplink/     tunnel abstraction, spool-backed envelope client
     health/     periodic heartbeat, reusing the same uplink client
 """
