@@ -3,7 +3,7 @@ import asyncio
 import httpx
 import numpy as np
 from mantau_core.buffer import DurableSpool
-from mantau_core.contracts import FallEvent
+from mantau_core.contracts import Heartbeat
 from mantau_core.resilience import BackoffPolicy
 
 from mantau_agent.capabilities import CapabilityReport, InferenceMode, PlatformType
@@ -61,7 +61,9 @@ async def test_spool_drains_promptly_after_server_recovery_and_stays_acked(tmp_p
             status_store=StatusStore(tmp_path / "status.json"), status_interval_s=.01,
         )
         await pipeline.start()
-        await uplink.send_event(FallEvent(camera_id="cam", event_id="event-one"))
+        # "event-one" marks this envelope in the requests checked below.
+        await uplink.send_heartbeat(Heartbeat(agent_id="agent", camera_id="event-one",
+                                              camera_reachable=True, detector_alive=False))
         assert spool.depth() >= 1
         online["value"] = True
         for _ in range(100):

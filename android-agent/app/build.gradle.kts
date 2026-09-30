@@ -22,12 +22,6 @@ android {
         buildConfigField("String", "DEFAULT_SERVER_URL", "\"$defaultServerUrl\"")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-
-        ndk {
-            // Phones (64- and 32-bit ARM) plus the x86_64 emulator. The app ships no
-            // native libraries of its own now; the filter keeps any future one to these ABIs.
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
-        }
     }
 
     buildTypes {

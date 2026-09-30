@@ -1,9 +1,5 @@
 package id.mantau.agent.model
 
-import android.app.ActivityManager
-import android.content.Context
-import android.os.Build
-import id.mantau.agent.BuildConfig
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Instant
@@ -119,17 +115,6 @@ object WirePayloads {
         val recommendationReason: String = "Detection runs on the server (CLOUD).",
     )
 
-    fun capabilities(context: Context): JSONObject {
-        val memory = (context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager)
-            .let { manager -> ActivityManager.MemoryInfo().also(manager::getMemoryInfo).totalMem }
-        return capabilities(CapabilityFacts(
-            architecture = Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown",
-            cpu = Build.HARDWARE.ifBlank { Build.BOARD },
-            memoryBytes = memory,
-            softwareVersion = BuildConfig.VERSION_NAME,
-        ))
-    }
-
     fun capabilities(facts: CapabilityFacts): JSONObject {
         return JSONObject()
             .put("schema_version", 1)
@@ -144,9 +129,6 @@ object WirePayloads {
             .put("supported_inference_modes", JSONArray(facts.supportedInferenceModes))
             .put("recommendation_reason", facts.recommendationReason)
     }
-
-    fun status(context: Context, config: AgentConfig, runtime: RuntimeStatus, enrolled: Boolean): JSONObject =
-        status(config, runtime, enrolled, capabilities(context))
 
     fun status(config: AgentConfig, runtime: RuntimeStatus, enrolled: Boolean, capabilities: JSONObject): JSONObject =
         JSONObject()
