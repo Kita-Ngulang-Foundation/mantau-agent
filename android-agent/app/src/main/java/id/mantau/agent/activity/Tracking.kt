@@ -1,6 +1,5 @@
 package id.mantau.agent.activity
 
-import id.mantau.agent.inference.fall.PersonObservation
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import kotlin.math.hypot

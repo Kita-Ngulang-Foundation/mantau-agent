@@ -19,6 +19,8 @@ data class RuntimeStatus(
     val reconnectCount: Int = 0,
     val effectiveInferenceMode: String = "CLOUD",
     val inferenceExplanation: String? = null,
+    /** True while the server offers inference (`GET /inference/capability`), the only detector. */
+    val serverInferenceAvailable: Boolean = false,
     val eventQueueDepth: Int = 0,
     val uploadedFrames: Long = 0,
     val discardedFrames: Long = 0,
@@ -114,7 +116,7 @@ object WirePayloads {
         val supportedDetectorBackends: List<String> = emptyList(),
         val recommendedMode: String = "CLOUD",
         val supportedInferenceModes: List<String> = listOf("AUTO", "CLOUD"),
-        val recommendationReason: String = "Capability benchmark completed.",
+        val recommendationReason: String = "Detection runs on the server (CLOUD).",
     )
 
     fun capabilities(context: Context): JSONObject {
@@ -125,7 +127,6 @@ object WirePayloads {
             cpu = Build.HARDWARE.ifBlank { Build.BOARD },
             memoryBytes = memory,
             softwareVersion = BuildConfig.VERSION_NAME,
-            recommendationReason = "Capability benchmark has not completed.",
         ))
     }
 
@@ -160,15 +161,15 @@ object WirePayloads {
                 runtime.running -> "active"
                 else -> "configuring_camera"
             })
-            .put("health_state", if (runtime.running && runtime.effectiveInferenceMode == "CLOUD") "degraded" else runtime.health.wireValue)
+            .put("health_state", if (runtime.running && !runtime.serverInferenceAvailable) "degraded" else runtime.health.wireValue)
             .put("requested_inference_mode", config.requestedInferenceMode)
             .put("effective_inference_mode", runtime.effectiveInferenceMode)
             .put("capabilities", capabilities)
             .put("camera_connectivity", runtime.cameraConnectivity.wireValue)
             .put("last_heartbeat_at", runtime.lastControlContactAt?.toString() ?: JSONObject.NULL)
             .put("last_frame_at", runtime.lastFrameAt?.toString() ?: JSONObject.NULL)
-            .put("health_explanation", runtime.explanation ?: if (runtime.effectiveInferenceMode == "CLOUD")
-                "Cloud detection is unavailable on this server; sampled frames provide live view only."
+            .put("health_explanation", runtime.explanation ?: if (!runtime.serverInferenceAvailable)
+                "Server inference is unavailable; frames are discarded and nothing is detected until it returns."
                 else runtime.inferenceExplanation ?: JSONObject.NULL)
 }
 

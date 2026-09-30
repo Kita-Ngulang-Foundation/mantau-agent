@@ -14,7 +14,7 @@ data class ActivitySettings(
     val timezone: ZoneId = ZoneId.of("Asia/Jakarta"),
     val zones: List<Zone> = emptyList(),
     val stillnessEnabled: Boolean = true,
-    val floorMinutes: Double = 2.0,
+    val floorMinutes: Double = 0.5,
     val otherMinutes: Double = 45.0,
     val nocturnalEnabled: Boolean = true,
     val nightStart: LocalTime = LocalTime.of(22, 0),
