@@ -24,8 +24,8 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
-            // Phones (64- and 32-bit ARM) plus the x86_64 emulator. 32-bit x86
-            // only exists on old emulators and would add ~55 MB of native code.
+            // Phones (64- and 32-bit ARM) plus the x86_64 emulator. The app ships no
+            // native libraries of its own now; the filter keeps any future one to these ABIs.
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
         }
     }
@@ -53,33 +53,12 @@ android {
     buildFeatures {
         buildConfig = true
     }
-
-    androidResources {
-        // Models are hashed and handed to the runtimes as-is.
-        noCompress += listOf("task", "onnx")
-    }
 }
 
 dependencies {
-    // On-device detection: MediaPipe pose + the ONNX fall-confirmation classifier.
-    implementation("com.google.mediapipe:tasks-vision:1.0.0")
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.30.0")
-
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
-    // JVM build of the same ONNX Runtime API, so unit tests run the real classifier.
-    testImplementation("com.microsoft.onnxruntime:onnxruntime:1.30.0")
-
-    // On-device check of the real MediaPipe + ONNX Runtime path (emulator or phone).
-    androidTestImplementation("androidx.test:runner:1.6.2")
-    androidTestImplementation("androidx.test.ext:junit:1.2.1")
-    androidTestImplementation("junit:junit:4.13.2")
 }
-
-// The Android ONNX Runtime ships only device native libraries; host unit tests
-// use the JVM artifact above instead.
-configurations.matching { it.name.startsWith("test") && it.name.endsWith("RuntimeClasspath") }
-    .configureEach { exclude(group = "com.microsoft.onnxruntime", module = "onnxruntime-android") }
 
 tasks.withType<Test>().configureEach {
     systemProperty(
@@ -90,14 +69,6 @@ tasks.withType<Test>().configureEach {
         "mantau.core.activity.fixtures",
         rootProject.file("../../mantau-core/src/mantau_core/activity/fixtures/activity_sequences").absolutePath,
     )
-    systemProperty(
-        "mantau.core.detection.fixtures",
-        rootProject.file("../../mantau-core/src/mantau_core/detection/fixtures").absolutePath,
-    )
-    // Optional live end-to-end post (SignedFallEventTest); unset = skipped.
-    for (name in listOf("server", "agentId", "secret", "cameraId", "seq")) {
-        (project.findProperty("mantau.e2e.$name") as String?)?.let { systemProperty("mantau.e2e.$name", it) }
-    }
     systemProperty(
         "mantau.protocol.examples",
         rootProject.file("../../protocol/examples").absolutePath,

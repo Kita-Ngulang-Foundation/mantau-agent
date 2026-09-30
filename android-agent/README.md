@@ -12,46 +12,34 @@ The Android agent uses the existing v1 control contracts and endpoints:
 - durable command results: `POST /agent-control/commands/{id}/results`;
 - `platform` is always `android` in status and capability reports.
 
-The agent benchmarks architecture, memory, Android GPU/NNAPI API availability,
-detector availability/latency, and thermal state. It maps those facts into the
-existing v1 capability fields and reports the selected mode and explanation in
-the existing status/health fields. It does not add Android-only wire fields.
+The agent does no detection of its own: inference is CLOUD only. It reads the
+camera, uploads frames to the server and reports health. It reports
+architecture, memory, Android GPU/NNAPI API availability and thermal state in
+the existing v1 capability fields, and the requested mode, effective mode and
+explanation in the existing status/health fields. It does not add Android-only
+wire fields.
 
-Advertised modes are the ones that can run: EDGE when the detector loaded and
-benchmarked, CLOUD when the server's `GET /inference/capability` says it runs the
-detector (re-read every heartbeat), HYBRID with both. CLOUD decodes the RTSP
-H.264 substream locally and sends signed JPEGs to `POST /agents/{id}/inference`
+Every stored or requested mode (AUTO, EDGE, CLOUD, HYBRID; all four stay valid
+so existing configurations keep loading, and AUTO stays the default) resolves to
+CLOUD. The capability report advertises AUTO and CLOUD and recommends CLOUD.
+Server inference exists while the server's `GET /inference/capability` says it
+runs the detector (re-read every heartbeat). The agent decodes the RTSP H.264
+substream locally and sends signed JPEGs to `POST /agents/{id}/inference`
 (`uplink/InferenceUplink.kt`, the same contract and golden signature as the
-Python agent) at 10 fps capped by the server's `max_fps`; the server runs the
-fall detector and stores/pushes falls under this agent. Live view keeps its own
-1 FPS upload to `POST /cameras/{camera_id}/frame`. Frames are 640 pixels wide at
-most, refused above the server's size limit, retried once on a network/5xx
-error with the same frame id, dropped once stale, and never spooled.
+Python agent) at a fixed 15 fps, capped by the server's `max_fps`; the server
+runs the fall detector and the activity rules and stores/pushes events under this
+agent. Live view keeps its own 1 FPS upload to `POST /cameras/{camera_id}/frame`.
+Frames are 640 pixels wide at most, refused above the server's size limit,
+retried once on a network/5xx error with the same frame id, dropped once stale,
+and never spooled.
 
-EDGE runs on the phone (`inference/fall/`): MediaPipe Tasks Pose Landmarker
-(`pose_landmarker_lite.task`, Apache-2.0), a Kotlin port of mantau-AI's fall
-rules (tracker, fall state machine, window features), and the same
-`fall_classifier.onnx` the Python agent runs, through ONNX Runtime for Android.
-The bundled files in `app/src/main/assets/mantau/` are checked against
-mantau-core's pinned manifest (size + SHA-256) before loading; if any check or
-runtime load fails, EDGE is not advertised and the reason is reported. Events
-carry the same fields and signal names as the Python agent's and pass through
-the existing cooldown/deduplication gate. Pose tracks every frame the inference
-loop takes while the scene moves; after 3 s without motion `IdleGate` switches to
-a stateless image-mode check twice a second (like the Python agent's idle
-keepalive), so a still person keeps being observed and an emptied room reads as
-empty. The activity rules (`activity/`: prolonged position, nocturnal movement,
-bathroom duration) are a Kotlin port of mantau-core's, run on the same
-observations and configured by the same DetectionSettings JSON.
-
-HYBRID sends local events immediately plus one confirmation frame per event
-(five-second minimum interval) with the event id; the server's answer is stored
-on the event. AUTO selects EDGE when the detector loaded and its benchmark keeps
-at least 10 fps; otherwise CLOUD when the server offers inference, else the
-slower EDGE. Explicit modes fall back to what can run: EDGE with a model that
-failed to load goes to CLOUD, CLOUD/HYBRID without server inference go to EDGE,
-and a detector that fails while running hands over to CLOUD. Only when nothing
-can run does selection fail, with the reason in status.
+When the server offers no inference, the agent does not fall back to on-device
+detection: it discards frames, reports degraded health with the reason, and
+detects nothing until the server offers inference again. The app bundles no
+models. `activity/` keeps a Kotlin port of mantau-core's activity rules
+(prolonged position, nocturnal movement, bathroom duration), held to the core
+fixtures by `ActivityParityTest`; the running agent does not call it, because
+the server runs those rules.
 
 ## Build
 
@@ -141,9 +129,9 @@ a development server on the home LAN can be used.
   acknowledgements remove them atomically, so a recovered event keeps its
   original sequence and signature and server-side deduplication prevents a
   duplicate delivery.
-- Inference-mode commands update the requested mode durably. The effective mode
-  is re-evaluated against detector health and thermal pressure, and status
-  reports requested mode, effective mode, reason, queue depth, and disposable
+- Inference-mode commands accept AUTO, EDGE, CLOUD or HYBRID and store the
+  requested mode durably; the effective mode is always CLOUD. Status reports
+  requested mode, effective mode, reason, queue depth, and disposable
   frame-upload counters without exposing credentials.
 
 Stopping the service releases the RTSP socket and wake lock and removes the
@@ -157,21 +145,10 @@ compatibility, exact Python-agent golden envelope/signature compatibility,
 service lifecycle state, multicast-lock cleanup, multi-camera discovery
 parsing/deduplication, RTSP state transitions, latest-frame and upload queue
 bounds, reconnect behavior, signed frame requests, disposable outage behavior,
-durable queue recovery, cooldown/deduplication, detector and thermal fallback,
-and inference-mode transitions. `FallParityTest` replays mantau-core's recorded
-pose sequences (copied into `src/test/resources/pose_sequences`) through the
-Kotlin rules and the real ONNX model and requires the exact per-frame decisions
-the Python rules recorded; `ModelAssetsTest` checks the bundled models and
-fixture copies against mantau-core. `ObservationParityTest` and
-`ActivityParityTest` replay mantau-core's observation and activity fixtures
-(`src/test/resources/activity_sequences`) and require exactly the events the
-Python rules produce.
+durable queue recovery, and inference-mode resolution. `ActivityParityTest`
+replays mantau-core's activity fixtures (`src/test/resources/activity_sequences`)
+and requires exactly the events the Python rules produce.
 
-`connectedDebugAndroidTest` runs the real MediaPipe + ONNX Runtime path on a
-device or emulator. Generate its frames first with
-`scripts/prepare-instrumentation-frames.sh` (third-party footage, not committed).
-`StagedScenesTest` replays scenes staged by `integration/stage_activity_clips.py`
-(pass `e2eScene` and base64 `e2eSettings`; with `e2eServer` and agent
-credentials it also posts the signed events to a running server). Real ONVIF cameras, MediaCodec/vendor RTSP
+There are no instrumentation tests. Real ONVIF cameras, MediaCodec/vendor RTSP
 variants, device power management, and control-plane integration still require
 hardware testing on the target phone and LAN.

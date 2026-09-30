@@ -1,7 +1,5 @@
 package id.mantau.agent.activity
 
-import id.mantau.agent.inference.fall.PersonObservation
-import id.mantau.agent.inference.fall.Posture
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals

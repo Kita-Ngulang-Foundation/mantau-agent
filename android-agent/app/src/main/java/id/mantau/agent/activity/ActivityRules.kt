@@ -1,8 +1,6 @@
 package id.mantau.agent.activity
 
 import id.mantau.agent.activity.ActivitySettings.ZoneKind
-import id.mantau.agent.inference.fall.NumpyMath
-import id.mantau.agent.inference.fall.Posture
 import id.mantau.agent.uplink.FallEvent
 import java.security.MessageDigest
 import java.time.Instant
@@ -146,8 +144,10 @@ class ProlongedPositionRule : ActivityRule {
             state.floorS += step.dt
             state.floorMoved += obs.motion
             state.uprightS = 0.0
-            for (severity in ActivityMath.levels(state.floorS, floorS, state.floorFired)) {
-                events += event(step, person, severity, "floor", state.floorStart!!, state.floorS,
+            // Lying on the floor pages once per episode, critical like a fall, as soon as
+            // floor_minutes has passed (no warning step).
+            if (state.floorS >= floorS && state.floorFired.add("critical")) {
+                events += event(step, person, "critical", "floor", state.floorStart!!, state.floorS,
                     state.floorMoved, state.floorZone)
             }
         } else if (state.floorStart != null) {
@@ -190,11 +190,12 @@ class ProlongedPositionRule : ActivityRule {
         durationS: Double, moved: Double, zoneId: String?,
     ) = ActivityMath.event(
         step, kind, severity, "$branch:${person.localId}@${started.toEpochMilli()}",
-        signals = mapOf(
-            "duration_s" to NumpyMath.round(durationS, 1),
-            "movement" to NumpyMath.round(moved, 4),
-            "confidence" to NumpyMath.round(person.observation.confidence, 3),
-        ),
+        signals = buildMap<String, Double> {
+            put("duration_s", NumpyMath.round(durationS, 1))
+            put("movement", NumpyMath.round(moved, 4))
+            put("confidence", NumpyMath.round(person.observation.confidence, 3))
+            if (branch == "floor") put("floor", 1.0)
+        },
         confidence = person.observation.confidence, trackId = person.localId, zoneId = zoneId,
     )
 

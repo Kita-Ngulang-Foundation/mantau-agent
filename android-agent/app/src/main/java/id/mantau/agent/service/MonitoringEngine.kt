@@ -2,19 +2,13 @@ package id.mantau.agent.service
 
 import android.content.Context
 import android.os.SystemClock
-import id.mantau.agent.activity.ActivityEngine
 import id.mantau.agent.activity.ActivitySettings
-import id.mantau.agent.activity.FrameObservation
-import id.mantau.agent.activity.toFallEvent
 import id.mantau.agent.discovery.AndroidWsDiscovery
 import id.mantau.agent.inference.AndroidH264JpegDecoder
 import id.mantau.agent.inference.AndroidThermalStateProvider
-import id.mantau.agent.inference.CapabilityBenchmark
-import id.mantau.agent.inference.FallEventGate
-import id.mantau.agent.inference.HybridConfirmationPolicy
+import id.mantau.agent.inference.DeviceCapabilities
 import id.mantau.agent.inference.InferenceModePolicy
 import id.mantau.agent.inference.ModeSelection
-import id.mantau.agent.inference.fall.MediaPipeFallDetector
 import id.mantau.agent.model.AgentConfig
 import id.mantau.agent.model.CameraConfig
 import id.mantau.agent.model.CameraConnectivity
@@ -39,7 +33,6 @@ import id.mantau.agent.storage.AndroidKeystoreSecretStore
 import id.mantau.agent.storage.RuntimeStatusStore
 import id.mantau.agent.uplink.CloudUploadPolicy
 import id.mantau.agent.uplink.DurableUplink
-import id.mantau.agent.uplink.FallEvent
 import id.mantau.agent.uplink.FrameUploadPolicy
 import id.mantau.agent.uplink.Heartbeat
 import id.mantau.agent.uplink.HttpInferenceTransport
@@ -68,22 +61,15 @@ class MonitoringEngine(
     private val control = ControlPlaneClient()
     private val discovery = AndroidWsDiscovery(context)
     private val frames = LatestFrameBuffer(2)
-    private val detector = MediaPipeFallDetector(context)
     private val thermal = AndroidThermalStateProvider(context)
-    @Volatile private var capabilities = CapabilityBenchmark(context, thermal).run(detector)
-    @Volatile private var detectorFailure: String? = null
-    // Server inference: exists only while GET /inference/capability says so.
+    private val device = DeviceCapabilities.read(context)
+    // Server inference, the only detector: exists only while GET /inference/capability says so.
+    // Without it frames are discarded and health is degraded; there is no on-device fallback.
     private val inferenceTransport = HttpInferenceTransport()
     @Volatile private var inferenceUplink: HttpInferenceUplink? = null
     @Volatile private var cloudPolicy: CloudUploadPolicy? = null
-    private val modePolicy = InferenceModePolicy(
-        detectorAvailable = { capabilities.detectorAvailable && detectorFailure == null },
-        detectorFailure = { detectorFailure ?: detector.availability.reason },
-        cloudAvailable = { inferenceUplink != null },
-        detectorFastEnough = { capabilities.facts?.detectorFastEnough ?: false },
-        thermal = thermal,
-    )
-    @Volatile private var selection = ModeSelection("AUTO", "CLOUD", capabilities.reason)
+    private val modePolicy = InferenceModePolicy(cloudAvailable = { inferenceUplink != null })
+    @Volatile private var selection = modePolicy.select("AUTO")
     private val frameQueue = LatestWorkQueue<id.mantau.agent.uplink.JpegFrame>(2)
     private val uploadPolicy = FrameUploadPolicy()
     private val frameUploader = SignedFrameUploader(
@@ -96,13 +82,6 @@ class MonitoringEngine(
         agentId = { configStore.load().agentId },
         secret = { requireNotNull(configStore.agentSecret()) },
         stateDirectory = java.io.File(context.filesDir, "uplink"),
-    )
-    private val hybridPolicy = HybridConfirmationPolicy()
-    // Prolonged position, nocturnal movement and bathroom duration, on this device's own
-    // observations (EDGE/HYBRID). In CLOUD mode the server runs the same rules.
-    private val activity = ActivityEngine(
-        runCatching { configStore.detectionSettings()?.let(ActivitySettings::parse) }.getOrNull()
-            ?: ActivitySettings(),
     )
     private val uploadedFrames = AtomicLong()
     private val discardedFrames = AtomicLong()
@@ -200,7 +179,7 @@ class MonitoringEngine(
                         if (second != lastPersistedFrameSecond) {
                             lastPersistedFrameSecond = second
                             publish(runtime.copy(
-                                health = HealthState.ONLINE,
+                                health = if (inferenceUplink != null) HealthState.ONLINE else HealthState.DEGRADED,
                                 cameraConnectivity = CameraConnectivity.CONNECTED,
                                 lastFrameAt = frame.capturedAt,
                                 explanation = null,
@@ -220,8 +199,6 @@ class MonitoringEngine(
                     explanation = safeFailure("Camera connection failed", exception),
                 ))
             } finally {
-                // Timers pause across the reconnect instead of counting the outage.
-                activity.cameraLost()
                 decoder.close()
                 frameQueue.clear()
                 rtsp.close()
@@ -233,78 +210,38 @@ class MonitoringEngine(
     }
 
     private fun inferenceLoop() {
-        var gateCameraId: String? = null
-        var eventGate: FallEventGate? = null
-        try {
-            while (running.get()) {
-                val jpeg = frameQueue.take() ?: break
-                if (Instant.now().toEpochMilli() - jpeg.capturedAtMs > 5_000) {
-                    discardedFrames.incrementAndGet()
-                    continue
-                }
-                val mode = selection.effective
-                val uplink = inferenceUplink
-                if (mode == "CLOUD" && (uplink == null ||
-                        cloudPolicy?.admit(SystemClock.elapsedRealtime()) != true)) {
-                    discardedFrames.incrementAndGet()
-                    continue
-                }
-                try {
-                    val config = configStore.load()
-                    val camera = config.camera ?: continue
-                    if (mode == "CLOUD" && uplink != null) {
-                        // The server runs the fall detector on this frame; falls it finds
-                        // are stored and pushed there, under this agent.
-                        if (uplink.submit(jpeg.bytes, camera.cameraId, jpeg.capturedAtMs)) {
-                            uploadedFrames.incrementAndGet()
-                        } else {
-                            // Frames are deliberately disposable: never enter the event spool.
-                            uploadFailures.incrementAndGet()
-                            discardedFrames.incrementAndGet()
-                        }
-                        // Live view keeps its own, lower rate on its own endpoint.
-                        if (uploadPolicy.admit(jpeg, SystemClock.elapsedRealtime())) {
-                            frameUploader.upload(camera.cameraId, jpeg.bytes)
-                        }
-                        continue
-                    }
-
-                    if (gateCameraId != camera.cameraId) {
-                        gateCameraId = camera.cameraId
-                        eventGate = FallEventGate(camera.cameraId)
-                    }
-                    val perception = detector.perceive(jpeg)
-                    val events = perception.candidates.mapNotNull {
-                        eventGate?.accept(it, Instant.ofEpochMilli(jpeg.capturedAtMs))
-                    }
-                    perception.people?.let { people ->
-                        val observation = FrameObservation(camera.cameraId, Instant.ofEpochMilli(jpeg.capturedAtMs), people)
-                        for (event in activity.update(observation)) {
-                            durableUplink.sendEvent(event.toFallEvent())
-                        }
-                    }
-                    for (event in events) {
-                        durableUplink.sendEvent(event)
-                        if (mode == "HYBRID" && hybridPolicy.shouldUpload(event.eventId, jpeg.capturedAtMs)) {
-                            // One confirmation frame per event, correlated by event id.
-                            val confirmed = inferenceUplink?.submit(
-                                jpeg.bytes, camera.cameraId, jpeg.capturedAtMs, listOf(event.eventId),
-                            ) ?: false
-                            if (!confirmed) uploadFailures.incrementAndGet()
-                        }
-                    }
-                } catch (exception: Exception) {
-                    detectorFailure = "Detector/decoder failure (${exception::class.java.simpleName}); using CLOUD."
-                    selection = ModeSelection(selection.requested, "CLOUD", detectorFailure!!)
-                    publish(runtime.copy(
-                        effectiveInferenceMode = "CLOUD",
-                        inferenceExplanation = detectorFailure,
-                        health = HealthState.DEGRADED,
-                    ))
-                }
+        while (running.get()) {
+            val jpeg = frameQueue.take() ?: break
+            if (Instant.now().toEpochMilli() - jpeg.capturedAtMs > 5_000) {
+                discardedFrames.incrementAndGet()
+                continue
             }
-        } finally {
-            detector.close()
+            // Every mode is CLOUD: no server inference (or over the upload rate) = discard.
+            val uplink = inferenceUplink
+            if (uplink == null || cloudPolicy?.admit(SystemClock.elapsedRealtime()) != true) {
+                discardedFrames.incrementAndGet()
+                continue
+            }
+            try {
+                val config = configStore.load()
+                val camera = config.camera ?: continue
+                // The server runs the fall detector on this frame; falls it finds
+                // are stored and pushed there, under this agent.
+                if (uplink.submit(jpeg.bytes, camera.cameraId, jpeg.capturedAtMs)) {
+                    uploadedFrames.incrementAndGet()
+                } else {
+                    // Frames are deliberately disposable: never enter the event spool.
+                    uploadFailures.incrementAndGet()
+                    discardedFrames.incrementAndGet()
+                }
+                // Live view keeps its own, lower rate on its own endpoint.
+                if (uploadPolicy.admit(jpeg, SystemClock.elapsedRealtime())) {
+                    frameUploader.upload(camera.cameraId, jpeg.bytes)
+                }
+            } catch (exception: Exception) {
+                uploadFailures.incrementAndGet()
+                discardedFrames.incrementAndGet()
+            }
         }
     }
 
@@ -323,7 +260,8 @@ class MonitoringEngine(
                         cameraId = config.camera?.cameraId,
                         sentAt = Instant.now(),
                         cameraReachable = runtime.cameraConnectivity == CameraConnectivity.CONNECTED,
-                        detectorAlive = selection.effective != "CLOUD" && detectorFailure == null,
+                        // No on-device detector: detection runs on the server only.
+                        detectorAlive = false,
                         queueDepth = durableUplink.depth(),
                     )
                     runCatching { durableUplink.sendHeartbeat(heartbeat) }
@@ -335,6 +273,7 @@ class MonitoringEngine(
             publish(runtime.copy(
                 effectiveInferenceMode = selection.effective,
                 inferenceExplanation = selection.reason,
+                serverInferenceAvailable = inferenceUplink != null,
                 eventQueueDepth = durableUplink.depth(),
                 uploadedFrames = uploadedFrames.get(),
                 discardedFrames = discardedFrames.get() + frameQueue.dropped,
@@ -360,7 +299,9 @@ class MonitoringEngine(
             try {
                 val status = WirePayloads.status(
                     config, runtime, enrolled = true,
-                    capabilities = WirePayloads.capabilities(capabilities.wireFacts()),
+                    capabilities = WirePayloads.capabilities(
+                        device.wireFacts(thermal.current(), serverInference = inferenceUplink != null),
+                    ),
                 )
                 val command = control.poll(config.serverUrl, config.agentId, secret, status)
                 if (!running.get()) break
@@ -429,6 +370,7 @@ class MonitoringEngine(
             CommandResult(command.commandId, "succeeded", message = "Camera configuration saved; capture restarted.")
         }
         "set_inference_mode" -> {
+            // Any of AUTO/EDGE/CLOUD/HYBRID is accepted and stored; the effective mode is CLOUD.
             val mode = command.payload.getString("mode")
             val selected = modePolicy.select(mode)
             val current = configStore.load()
@@ -456,9 +398,9 @@ class MonitoringEngine(
                 command.payload,
                 expectedCameraId = configStore.load().camera?.cameraId,
             )
-            val parsed = ActivitySettings.parse(settings.raw)
+            // Parsed only to reject a malformed payload; the server runs the activity rules.
+            ActivitySettings.parse(settings.raw)
             configStore.saveDetectionSettings(settings.raw)
-            activity.applySettings(parsed)
             CommandResult(
                 command.commandId, "succeeded", message = "Detection settings stored.",
                 data = JSONObject()
@@ -495,12 +437,11 @@ class MonitoringEngine(
 
     private fun safeSelection(requested: String): ModeSelection = try {
         modePolicy.select(requested)
-    } catch (exception: UnsupportedOperationException) {
-        // Nothing can run: report it plainly; CLOUD without an uplink discards frames.
-        ModeSelection(requested, "CLOUD", exception.message ?: "No inference mode is available.")
+    } catch (exception: IllegalArgumentException) {
+        ModeSelection(requested, "CLOUD", exception.message ?: "Unknown inference mode.")
     }
 
-    /** Re-reads the server's inference capability; CLOUD/HYBRID exist only while it says so. */
+    /** Re-reads the server's inference capability; detection exists only while it says so. */
     private fun refreshServerInference(config: AgentConfig) {
         val capability = discoverInferenceCapability(config.serverUrl, inferenceTransport)
         if (capability == null || !capability.available) {
@@ -515,9 +456,6 @@ class MonitoringEngine(
                 transport = inferenceTransport,
             )
             cloudPolicy = CloudUploadPolicy(CLOUD_UPLOAD_FPS, capability)
-        }
-        capabilities.facts?.let { facts ->
-            capabilities = facts.snapshot(thermal.current(), inferenceUplink != null)
         }
     }
 
@@ -554,7 +492,7 @@ class MonitoringEngine(
         private const val POLL_INTERVAL_MS = 5_000L
         private const val HEARTBEAT_INTERVAL_MS = 30_000L
         private const val UPLINK_TICK_MS = 2_000L
-        /** Server-inference upload rate; below ~10 fps the fall rules lose people mid-fall. */
-        private const val CLOUD_UPLOAD_FPS = 10.0
+        /** Fixed server-inference upload rate; the server's `max_fps` caps it (15 by default). */
+        private const val CLOUD_UPLOAD_FPS = 15.0
     }
 }

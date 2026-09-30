@@ -21,6 +21,7 @@ class RuntimeStatusStore(context: Context) {
         reconnectCount = preferences.getInt("reconnect_count", 0),
         effectiveInferenceMode = preferences.getString("effective_mode", "CLOUD") ?: "CLOUD",
         inferenceExplanation = preferences.getString("inference_explanation", null),
+        serverInferenceAvailable = preferences.getBoolean("server_inference", false),
         eventQueueDepth = preferences.getInt("event_queue_depth", 0),
         uploadedFrames = preferences.getLong("uploaded_frames", 0),
         discardedFrames = preferences.getLong("discarded_frames", 0),
@@ -41,6 +42,7 @@ class RuntimeStatusStore(context: Context) {
             .putInt("reconnect_count", status.reconnectCount)
             .putString("effective_mode", status.effectiveInferenceMode)
             .putString("inference_explanation", status.inferenceExplanation)
+            .putBoolean("server_inference", status.serverInferenceAvailable)
             .putInt("event_queue_depth", status.eventQueueDepth)
             .putLong("uploaded_frames", status.uploadedFrames)
             .putLong("discarded_frames", status.discardedFrames)
