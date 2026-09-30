@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 
 from mantau_core.resilience import BackoffPolicy, Supervisor
@@ -22,7 +23,9 @@ class MonitoringPipeline:
                  heartbeat_interval_s: float = 30.0,
                  spool_backoff: BackoffPolicy | None = None,
                  status_store: StatusStore | None = None,
-                 status_interval_s: float = 5.0, control_worker=None) -> None:
+                 status_interval_s: float = 5.0, control_worker=None,
+                 inference_probe: Callable[[], Awaitable[bool]] | None = None,
+                 inference_probe_interval_s: float = 60.0) -> None:
         self.puller, self.router = puller, router
         self.uplink, self.spool, self.tunnel = uplink, spool, tunnel
         self.poll_interval_s = poll_interval_s
@@ -37,6 +40,11 @@ class MonitoringPipeline:
         self._status_store = status_store
         self._status_interval_s = status_interval_s
         self.control_worker = control_worker
+        # Without server inference the agent detects nothing. This probe asks
+        # the server again; once it offers inference the service restarts
+        # (the restarted pipeline builds the inference uplink).
+        self._inference_probe = inference_probe
+        self._inference_probe_interval_s = inference_probe_interval_s
         self.restart_requested = asyncio.Event()
         self.heartbeat = HeartbeatLoop(
             agent_id, camera_id, uplink, interval_s=heartbeat_interval_s,
@@ -72,6 +80,9 @@ class MonitoringPipeline:
                 if self.control_worker is not None:
                     self._tasks.append(asyncio.create_task(
                         self.control_worker.run(self._stop), name="pipeline-control"))
+                if self._inference_probe is not None:
+                    self._tasks.append(asyncio.create_task(
+                        self._await_server_inference(), name="pipeline-inference-probe"))
                 self._started = True
             except BaseException:
                 await self._shutdown()
@@ -92,6 +103,24 @@ class MonitoringPipeline:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.poll_interval_s)
             except asyncio.TimeoutError:
                 pass
+
+    async def _await_server_inference(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(),
+                                       timeout=self._inference_probe_interval_s)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                available = await self._inference_probe()
+            except Exception as exc:  # noqa: BLE001 -- keep probing; never stop monitoring
+                log.warning("Server inference probe failed (%s)", type(exc).__name__)
+                continue
+            if available:
+                log.warning("Server inference is available again; restarting to use it")
+                self.restart_requested.set()
+                return
 
     async def change_mode(self, mode) -> None:
         async with self._lock:
@@ -165,8 +194,7 @@ class MonitoringPipeline:
                 "restarts": getattr(self.puller, "restarts", 0),
             },
             "effective_inference_mode": self.router.mode.value,
-            "detector": {"alive": self.router.detector_alive,
-                         "backend": self.router.capabilities.detector_backend},
+            "detector": {"alive": self.router.detector_alive, "backend": None},
             "uplink": {
                 "connected": self.uplink.server_reachable,
                 "last_successful_server_contact": last_contact.isoformat() if last_contact else None,

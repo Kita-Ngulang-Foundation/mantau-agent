@@ -45,29 +45,23 @@ class Settings(CoreSettings):
     default_stream_profile: str = "sub"  # "sub" | "main"
 
     # -- detection -------------------------------------------------------------
-    detector_backend: str = "null"       # "null" | "mediapipe"
-    # Directory holding the pinned model files (see mantau_core.detection.
-    # artifacts); empty = the models packaged with the installed mantau-AI.
-    model_dir: str = ""
-    fall_classifier_enabled: bool = True
+    # Inference is CLOUD only: the agent uploads sampled frames and the server
+    # runs the fall detector. All four modes are still accepted (the stored
+    # default is AUTO) and every one runs as CLOUD. Settings of the removed
+    # on-device detector (MANTAU_DETECTOR_BACKEND, MANTAU_MODEL_DIR,
+    # MANTAU_DETECTION_FPS, ...) are ignored, not rejected.
     inference_mode: InferenceMode = InferenceMode.AUTO
-    # 15 fps matched full-frame-rate accuracy on the UR Fall and Y-B-Class clips;
-    # at 5-10 fps the tracker loses the person mid-fall and recall drops.
-    detection_fps: float = Field(default=15.0, gt=0, allow_inf_nan=False)
-    # CLOUD sends frames for the server to run the fall detector on. Below
-    # ~10 fps the fall tracker loses people mid-fall (mantau-AI
-    # docs/EVALUATION.md); the server's advertised max_fps caps this.
-    cloud_upload_fps: float = Field(default=10.0, gt=0, le=15.0, allow_inf_nan=False)
-    # Use server inference when the server offers it (CLOUD/HYBRID and the
-    # automatic fallback when the on-device detector cannot run).
+    # Frames per second uploaded for server inference. The default is the
+    # server's own cap (`inference_max_fps`, 15); a lower max_fps advertised
+    # by the server lowers it further.
+    cloud_upload_fps: float = Field(default=15.0, gt=0, le=15.0, allow_inf_nan=False)
+    # Use server inference when the server offers it. Without it the agent
+    # detects nothing and reports degraded health.
     cloud_inference_enabled: bool = True
-    hybrid_confirmation_fps: float = Field(default=0.2, gt=0, allow_inf_nan=False)
+    # How often an agent without server inference asks the server again.
+    inference_probe_interval_s: float = Field(default=60.0, gt=0, allow_inf_nan=False)
     frame_queue_size: int = Field(default=2, ge=1)
     upload_timeout_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)
-    # None = never fire a synthetic fall. Notifications are supposed to mean a
-    # real fall happened, so the default detector stays silent until a real
-    # model is wired in; set a frame count only when demoing the alert path.
-    null_detector_trigger_every: int | None = None
     sampler_keep_every_n: int = Field(default=1, ge=1)
     sampler_max_fps: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     poll_interval_s: float = Field(default=0.02, gt=0, allow_inf_nan=False)

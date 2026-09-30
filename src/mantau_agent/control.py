@@ -116,7 +116,8 @@ class CommandExecutor:
                 "cpu": caps["cpu"],
                 "memory_bytes": caps.get("memory_bytes"),
                 "available_accelerators": caps.get("available_accelerators", []),
-                "supported_detector_backends": caps.get("supported_detector_backends", []),
+                # No detector runs on the agent; the field stays in the contract.
+                "supported_detector_backends": [],
                 "software_version": caps["software_version"],
                 "recommended_mode": caps["recommended_mode"],
                 "supported_inference_modes": caps.get("supported_inference_modes", ["AUTO"]),
@@ -140,10 +141,6 @@ class CommandExecutor:
         except CameraCommandError as exc:
             return CommandResult(command_id=command.command_id, state=CommandState.FAILED,
                                  failure_reason=exc.reason, message="Camera connection failed. Check camera settings.")
-        except NotImplementedError:
-            return CommandResult(command_id=command.command_id, state=CommandState.FAILED,
-                                 failure_reason=CommandFailureReason.UNSUPPORTED,
-                                 message="Requested inference mode is unavailable on this agent.")
         except Exception as exc:
             # Exception text can contain URLs or credentials from third-party
             # libraries. Only the type crosses the reporting/logging boundary.
@@ -192,9 +189,8 @@ class CommandExecutor:
                 return {}, "Camera configuration saved; restart requested."
             return {"success": True}, "Camera connection succeeded."
         if command.command_type is CommandType.SET_INFERENCE_MODE:
+            # Any of the four modes is accepted and stored; every one runs as CLOUD.
             mode = InferenceMode(command.payload["mode"])
-            if mode.value not in self.status()["capabilities"]["supported_inference_modes"]:
-                raise NotImplementedError
             await self.pipeline.change_mode(mode)
             current = self.config_store.load()
             if current is not None:

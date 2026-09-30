@@ -33,7 +33,8 @@ log = logging.getLogger(__name__)
 class InferenceUplink(Protocol):
     async def submit(self, jpeg: bytes, *, camera_id: str, ts_ms: int,
                      event_ids: tuple[str, ...] = ()) -> bool:
-        """Accept a sampled frame; event_ids identifies HYBRID confirmation.
+        """Accept a sampled frame. event_ids is the contract's confirmation
+        field; this agent sends none (it runs CLOUD only).
 
         True means the server processed (or had already processed) the frame.
         False or an exception is a failed upload; frames are disposable.

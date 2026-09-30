@@ -1,7 +1,7 @@
 # Build context is the mantau-prototype/ PARENT directory (this repo's
 # sibling), e.g.: docker build -f Dockerfile -t mantau-agent ..
-# Needs the mantau-core and mantau-AI sibling checkouts (mantau-AI provides
-# on-device fall detection: MediaPipe pose, fall rules, ONNX classifier).
+# Needs the mantau-core sibling checkout. The agent runs no detector: it
+# uploads frames and the server runs fall detection (CLOUD only).
 # Builds for linux/amd64 and linux/arm64 alike, e.g.:
 #   docker buildx build --platform linux/arm64 -f mantau-agent/Dockerfile .
 #
@@ -11,25 +11,23 @@
 # board (python:3.12-slim already publishes arm64 variants).
 FROM python:3.12-slim
 
+# opencv-python-headless needs no GL/EGL libraries; glib stays for its runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg libgl1 libglib2.0-0 libegl1 libgles2 \
+        ffmpeg libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY mantau-AI /app/mantau-AI
 COPY mantau-core /app/mantau-core
 COPY mantau-agent /app/agent
 # Golden protocol examples: only the contract tests read them.
 COPY protocol/examples /app/protocol/examples
 
-RUN pip install --no-cache-dir -e /app/mantau-AI \
- && pip install --no-cache-dir -e /app/mantau-core \
+RUN pip install --no-cache-dir -e /app/mantau-core \
  && pip install --no-cache-dir -e "/app/agent[dev]"
 
 WORKDIR /app/agent
 ENV MANTAU_SEQ_PATH=/data/seq.txt
 ENV MANTAU_SPOOL_PATH=/data/spool.db
-ENV MANTAU_DETECTOR_BACKEND=mediapipe
 VOLUME ["/data"]
 
 CMD ["python", "-m", "mantau_agent.main"]

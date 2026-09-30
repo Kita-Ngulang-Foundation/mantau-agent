@@ -49,10 +49,9 @@ async def test_spool_drains_promptly_after_server_recovery_and_stays_acked(tmp_p
         capabilities = CapabilityReport(
             platform=PlatformType.LINUX_X86_64, architecture="x86_64", cpu="test",
             cpu_count=2, memory_bytes=1024**3, software_version="test",
-            detector_backend="null", supported_detector_backends=["null"],
         )
         router = InferenceRouter(
-            camera_id="cam", detector=None, event_uplink=uplink, frame_uplink=frame_uplink,
+            camera_id="cam", frame_uplink=frame_uplink,
             capabilities=capabilities, mode=InferenceMode.CLOUD, live_view_enabled=False)
         pipeline = MonitoringPipeline(
             puller=Puller(), router=router, uplink=uplink, spool=spool,

@@ -13,52 +13,49 @@ inference-mode wire models from `mantau-core`. Android reports platform
 remain outside the Flutter control app.
 
 The Linux/Pi agent discovers or accepts a manual RTSP camera, captures the
-preferred low-bitrate stream, routes sampled frames through the configured
-inference mode, durably uploads events and health, and runs under systemd.
+preferred low-bitrate stream, uploads sampled frames for the server to run fall
+detection on, durably uploads health, and runs under systemd.
 Raspberry Pi uses the same Linux ARM64 build and code path.
 
 ```text
 ONVIF/manual setup -> RTSP validation -> durable config
     -> CameraPuller (bounded reconnect backoff + jitter, latest frame)
     -> bounded independent sampling queues
-       EDGE   -> local detector -> signed event uplink
-       CLOUD  -> sampled frame -> server-inference interface
-       HYBRID -> local event + rate-limited server confirmation
+       CLOUD  -> sampled frame -> server inference (the server detects falls)
        live   -> existing signed live-view frame endpoint
     -> SQLite event/heartbeat spool -> prompt retry after connectivity returns
     -> heartbeat + atomic local status snapshot
 ```
 
-The Linux/Pi implementation reuses the existing `CameraPuller`, `FrameSampler`, core
-detector protocol and adapters, `FrameUplink`, signed envelopes, sequence
-counter, SQLite spool, and heartbeat contract. The Android implementation uses
-the same v1 control payloads, signed live-frame protocol, envelope signatures,
-and golden fixtures. Both agents detect falls on device (EDGE): the Python agent
-through `mantau_core.detection.MediapipeDetector`, the Android agent through
-MediaPipe Tasks Pose Landmarker plus a Kotlin port of the same fall rules and the
-same ONNX classifier. Model files are SHA-256 verified against mantau-core's
-pinned manifest before loading, and shared pose-sequence fixtures hold both ports
-to identical fall decisions. When the server offers inference
-(`GET /inference/capability`), both agents can also upload sampled frames for
-the server to run the same detector (CLOUD), or ask it to confirm local
-detections (HYBRID); a device whose model fails to load or is too slow falls
-back to CLOUD on its own.
+The Linux/Pi implementation reuses the existing `CameraPuller`, `FrameSampler`,
+`FrameUplink`, signed envelopes, sequence counter, SQLite spool, and heartbeat
+contract. The Android implementation uses the same v1 control payloads, signed
+live-frame protocol and envelope signatures.
+
+Inference is CLOUD only, in both agents: neither loads a model or detects falls
+on the device. The agent uploads sampled frames to the server
+(`POST /agents/{id}/inference`), which runs the fall detector through
+mantau-core, stores and pushes the falls it finds, and returns them so the agent
+can attach a review clip. When the server offers no inference
+(`GET /inference/capability`), the agent does not fall back to anything local:
+it reports degraded health, detects nothing, and asks the server again until
+it is back.
 
 ### Activity rules
 
-Besides falls, both agents run mantau-core's activity rules on the same pose
-observations, without extra models: prolonged position (on the floor, or
-anywhere outside a seating/bed zone), nocturnal movement (repeated bed exits
-or time out of bed inside the night window) and bathroom duration (someone
-entered the bathroom-door zone and has not been seen since). Each raises a
+Besides falls, the server runs mantau-core's activity rules on the pose
+observations of the frames the agent uploads, without extra models: prolonged
+position (on the floor, or anywhere outside a seating/bed zone), nocturnal
+movement (repeated bed exits or time out of bed inside the night window) and
+bathroom duration (someone entered the bathroom-door zone and has not been seen since). Each raises a
 warning and later a critical event with its own `kind`, deduplicated by a
 stable event id; signals carry only durations, movement, counts and
 confidence, never images or identities. Timers pause while the camera is
 disconnected, the person is lost or confidence is low. Thresholds, the night
-window and zones come from the camera's detection settings: the saved copy is
-applied on start and every `apply_detection_settings` command replaces it
-(the command channel must be enabled). In CLOUD mode the server runs the same
-rules on the frames it analyses.
+window and zones come from the camera's detection settings. The agent keeps
+its copy too: the saved settings are applied on start and every
+`apply_detection_settings` command replaces them (the command channel must be
+enabled).
 
 ## Linux / Raspberry Pi installation
 
@@ -91,8 +88,9 @@ still respected):
 4. Setup opens the selected RTSP stream and decodes one frame before saving it.
    When a substream is configured, setup validates and persists it as the
    preferred runtime profile.
-5. Choose `AUTO`, `EDGE`, `CLOUD`, or `HYBRID`. The service starts and is enabled
-   for future boots.
+5. Setup asks for no inference mode: fall detection runs on the server (CLOUD).
+   The stored mode stays `AUTO`. The service starts and is enabled for future
+   boots.
 
 After installation and configuration, routine operation requires no SSH or
 interactive login. systemd starts the agent at boot and restarts it after a
@@ -216,14 +214,10 @@ The principal runtime variables are:
 | `MANTAU_CAMERA_HOST`, `MANTAU_CAMERA_PORT` | empty, `554` | Manual/discovery fallback |
 | `MANTAU_CAMERA_MAIN_PATH`, `MANTAU_CAMERA_SUB_PATH` | `/stream1`, unset | RTSP profiles |
 | `MANTAU_DEFAULT_STREAM_PROFILE` | `sub` | Preferred profile; core falls back to main if no sub path exists |
-| `MANTAU_INFERENCE_MODE` | `AUTO` | Requested mode |
-| `MANTAU_DETECTOR_BACKEND` | `null` | `null` or `mediapipe` (real fall detection; needs `mantau-core[detection]`) |
-| `MANTAU_MODEL_DIR` | packaged | Directory with the pinned model files; each is SHA-256 verified before loading |
-| `MANTAU_FALL_CLASSIFIER_ENABLED` | `true` | Learned confirmation layer on top of the fall rules |
-| `MANTAU_DETECTION_FPS` | `15` | Local sample cap and AUTO throughput target (below ~15 fps the fall tracker loses people mid-fall) |
-| `MANTAU_CLOUD_UPLOAD_FPS` | `10` | Frames per second uploaded for server inference (capped by the server's `max_fps`; below ~10 fps the fall tracker loses people mid-fall) |
-| `MANTAU_CLOUD_INFERENCE_ENABLED` | `true` | Use server inference when the server offers it |
-| `MANTAU_HYBRID_CONFIRMATION_FPS` | `0.2` | HYBRID confirmation cap |
+| `MANTAU_INFERENCE_MODE` | `AUTO` | Accepted for compatibility (`AUTO`, `EDGE`, `CLOUD`, `HYBRID`); every value runs as CLOUD |
+| `MANTAU_CLOUD_UPLOAD_FPS` | `15` | Frames per second uploaded for server inference (at most 15, the server's cap; a lower server `max_fps` lowers it further) |
+| `MANTAU_CLOUD_INFERENCE_ENABLED` | `true` | Use server inference when the server offers it; without it the agent detects nothing |
+| `MANTAU_INFERENCE_PROBE_INTERVAL_S` | `60` | How often an agent without server inference asks the server again; when it is back the service restarts to use it |
 | `MANTAU_LIVE_VIEW_FPS` | `4` | Independent live-view rate |
 | `MANTAU_FRAME_QUEUE_SIZE` | `2` | Pending frames per route; oldest drops first |
 | `MANTAU_SEQ_PATH`, `MANTAU_SPOOL_PATH` | under `data/` | Durable uplink state |
@@ -262,30 +256,28 @@ history and additive tables without affecting the old agent.
 
 ## Inference modes and server boundary
 
+Inference is CLOUD only. `InferenceMode` keeps its four values so that a
+stored or requested mode still loads, but every one of them runs as CLOUD:
+
 | Mode | Effective behavior |
 |---|---|
-| `EDGE` | Run the local detector and send real events only. |
-| `CLOUD` | Upload sampled frames to `POST /agents/{id}/inference`; the server runs the fall detector, stores and pushes falls under this agent, and returns them (clips are attached as for local events). No local model is loaded. |
-| `HYBRID` | Send local events immediately and one rate-limited confirmation frame per event; the server's answer is stored on the event (`server_confirmed`). |
-| `AUTO` | EDGE when the detector initializes and its benchmark (real pose + rules + classifier on a frame with a person) keeps up with `MANTAU_DETECTION_FPS` and memory is at least 512 MiB. Otherwise CLOUD when the server offers inference, else a slower EDGE, with the reason. |
+| `AUTO` (default), `CLOUD` | Upload sampled frames to `POST /agents/{id}/inference`; the server runs the fall detector, stores and pushes falls under this agent, and returns them (a review clip is attached). |
+| `EDGE`, `HYBRID` | Accepted from `config.json`, `MANTAU_INFERENCE_MODE` or a `set_inference_mode` command and stored as given; they run as CLOUD. |
 
-Explicit choices are honored when they can run; otherwise the mode that still
-detects falls is used: EDGE with a model that fails to load (missing or
-tampered file, runtime error) falls back to CLOUD; CLOUD or HYBRID without
-server inference fall back to EDGE. A detector that throws while running also
-hands the camera over to CLOUD. Only when nothing can run is the requested mode
-kept and health reported as degraded. Capability reports list only modes that
-can run: EDGE when the detector loaded and benchmarked, CLOUD when the server
-offers inference, HYBRID with both.
-
-`NullDetector` remains compatible for wiring tests, but the production router
-suppresses all its output and any event marked `signals.synthetic`. Synthetic
-detections never reach alert or confirmation uplinks.
+There is no local fallback. When the server offers no inference, the agent
+detects nothing: health reports `degraded` with the reason "server inference
+unavailable", the heartbeat reports no detector, and the agent asks the server
+again every `MANTAU_INFERENCE_PROBE_INTERVAL_S`; once the server offers
+inference, the service restarts and uploads again. Capability reports list
+`AUTO` and `CLOUD` as supported and recommend `CLOUD`. Settings of the removed
+on-device detector (`MANTAU_DETECTOR_BACKEND`, `MANTAU_MODEL_DIR`,
+`MANTAU_FALL_CLASSIFIER_ENABLED`, `MANTAU_DETECTION_FPS`,
+`MANTAU_HYBRID_CONFIRMATION_FPS`) are ignored.
 
 Server inference uses its own signed endpoint (`mantau_core.contracts.inference`),
 never the live-view frame endpoint. `HttpInferenceUplink` reads the server's
-capability at startup; if the server does not offer inference, CLOUD/HYBRID do
-not exist on this agent (`cloud_available=false`). Each frame is signed over
+capability at startup; if the server does not offer inference, the agent
+reports `cloud_available=false` and uploads nothing for inference. Each frame is signed over
 every header and its bytes, refused locally above the server's size limit,
 retried at most once on a network/5xx error with the same frame id (the server
 answers a retry without re-running the detector), dropped once older than the
@@ -294,7 +286,7 @@ server's `max_frame_age_s`, and never spooled.
 Latency budget (CLOUD): the fall rules confirm a fall after the person has been
 on the ground for 1 s, so landing-to-alert is that second plus the time from
 capturing the confirming frame to the push request. Measured on a LAN with the
-simulated camera (17 falls, real MediaPipe on the server): capture to push
+simulated camera (17 falls, the real pose detector on the server): capture to push
 request median 87 ms, p95 99 ms, max 109 ms, i.e. about 1.1 s from landing.
 Budget: 2 s from landing to push request on the local network, leaving the rest
 of the 5 s target for WAN upload and FCM delivery. Sequential uploads reached
@@ -316,14 +308,15 @@ monotonic sequence counter prevents reuse across clean restarts.
 capture. It reports:
 
 - camera connectivity, last frame time, last error, and reconnect count;
-- effective inference mode and detector backend/liveness;
+- requested and effective inference mode (always CLOUD) and whether server
+  inference is available;
 - uplink connectivity, last error, and last successful server contact;
 - spool depth, queue/drop/upload details, version, PID, start time, and uptime.
 
 If the recorded PID no longer exists, the command marks the snapshot stopped
 and clears camera/uplink connectivity rather than reporting stale liveness.
 
-Shutdown stops admission, drains active detector/event work, interrupts retry
+Shutdown stops admission, drains active uploads, interrupts retry
 waits, releases RTSP/native resources, writes a stopped status snapshot, closes
 HTTP and SQLite, and lowers the tunnel. Pending envelopes and acknowledged
 state remain durable for the next systemd start.
@@ -353,13 +346,13 @@ py -3.12 -m venv .venv
 .venv\Scripts\python.exe -m pytest tests -q
 ```
 
-The suite uses local sockets, mock HTTP, injected captures/detectors, and real
-SQLite files. It covers discovery deduplication and ambiguity, RTSP validation,
-configuration interruption/corruption/rollback, environment precedence,
-queue/rate behavior, every inference mode, prompt outage recovery, durable
+The suite uses local sockets, mock HTTP, injected captures and inference
+uplinks, and real SQLite files. It covers discovery deduplication and ambiguity,
+RTSP validation, configuration interruption/corruption/rollback, environment
+precedence, queue/rate behavior, CLOUD routing, prompt outage recovery, durable
 acknowledgements, JSON status/discovery, shutdown, and packaging invariants.
 
-Hardware ONVIF multicast, real camera credential variants, MediaPipe model
-accuracy/sustained throughput, Tailscale, systemd execution on an actual Linux
+Hardware ONVIF multicast, real camera credential variants, sustained upload
+throughput to the server, Tailscale, systemd execution on an actual Linux
 host, and cross-built binaries require target/integration verification. Build
 and packaging commands are documented in `packaging/README.md`.
