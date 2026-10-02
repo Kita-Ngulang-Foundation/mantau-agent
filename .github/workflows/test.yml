@@ -26,17 +26,3 @@ jobs:
           pip install -e ".deps/mantau-core"
           pip install -e ".[dev]"
       - run: pytest -q
-
-  android:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: android-agent
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
-      - uses: android-actions/setup-android@v3
-      - run: ./gradlew testDebugUnitTest --no-daemon

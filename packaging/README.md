@@ -118,5 +118,5 @@ then validate RTSP capture, service restart, and outage spool recovery on the
 actual target class.
 
 The native Android Agent is a separate application and release path. See
-`../android-agent/README.md`; it does not use these PyInstaller or systemd
+the `mantau-android-agent` repository; it does not use these PyInstaller or systemd
 artifacts.

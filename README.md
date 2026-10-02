@@ -121,27 +121,11 @@ sudo sh packaging/uninstall.sh
 Only `packaging/uninstall.sh --purge` removes `/etc/mantau-agent`,
 `/var/lib/mantau-agent`, and the service account.
 
-## Android Agent installation
+## Android Agent
 
-Build the independent native project with Android SDK 36 and JDK 17 or 21:
-
-```powershell
-cd android-agent
-.\gradlew.bat testDebugUnitTest assembleDebug
-adb install -r app\build\outputs\apk\debug\app-debug.apk
-```
-
-Open **Mantau Agent** on the spare Android 8.0+ phone, enter the server URL and
-device name, enroll, then copy its claim code into `mantau-app`. Discover ONVIF
-cameras only while the phone is connected to the CCTV Wi-Fi, or use manual
-IP/RTSP configuration. Select a substream path when available, save, grant the
-notification permission, and start the foreground monitoring service.
-
-Android identity/configuration is stored in private app storage; agent/camera
-secrets and in-flight credential-bearing commands are encrypted with an Android
-Keystore AES-GCM key. The persistent notification reports failure/degraded
-state without credentials. See `android-agent/README.md` for Android build,
-installation, permission, security, RTSP, and hardware-test details.
+The native Android Agent lives in its own repository, `mantau-android-agent`,
+with its own build, tests, and APK releases. Installation, permissions,
+security, and RTSP details are in that repository's README.
 
 ## Camera setup behavior
 
