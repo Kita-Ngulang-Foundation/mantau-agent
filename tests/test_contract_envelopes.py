@@ -1,6 +1,6 @@
 """The "agent emits" half of the wire contract: `Envelope.for_event()` /
 `for_heartbeat()`, built from the same field values as the golden fixtures
-in `../../protocol/examples/`, must produce a byte-identical envelope --
+in `../protocol/examples/`, must produce a byte-identical envelope --
 same fields, same signature -- not just "roughly the same shape."
 
 Only needs `mantau_core` (already a dependency of this package); nothing
@@ -17,7 +17,7 @@ from pathlib import Path
 
 from mantau_core.contracts import Envelope, EventKind, FallEvent, Heartbeat, Severity
 
-EXAMPLES_DIR = Path(__file__).resolve().parents[2] / "protocol" / "examples"
+EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "protocol" / "examples"
 TEST_SECRET = "golden-example-shared-secret-do-not-use"  # see examples/README.md
 FIXED_TIME = datetime(2026, 9, 13, 4, 12, 3, 114000, tzinfo=timezone.utc)
 
