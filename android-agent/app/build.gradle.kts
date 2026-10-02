@@ -81,18 +81,21 @@ dependencies {
 configurations.matching { it.name.startsWith("test") && it.name.endsWith("RuntimeClasspath") }
     .configureEach { exclude(group = "com.microsoft.onnxruntime", module = "onnxruntime-android") }
 
+val coreCheckout = rootProject.file("../.deps/mantau-core").takeIf { it.isDirectory }
+    ?: rootProject.file("../../mantau-core")
+
 tasks.withType<Test>().configureEach {
     systemProperty(
         "mantau.contract.fixtures",
-        rootProject.file("../../mantau-core/src/mantau_core/contracts/fixtures/v1").absolutePath,
+        coreCheckout.resolve("src/mantau_core/contracts/fixtures/v1").absolutePath,
     )
     systemProperty(
         "mantau.core.activity.fixtures",
-        rootProject.file("../../mantau-core/src/mantau_core/activity/fixtures/activity_sequences").absolutePath,
+        coreCheckout.resolve("src/mantau_core/activity/fixtures/activity_sequences").absolutePath,
     )
     systemProperty(
         "mantau.core.detection.fixtures",
-        rootProject.file("../../mantau-core/src/mantau_core/detection/fixtures").absolutePath,
+        coreCheckout.resolve("src/mantau_core/detection/fixtures").absolutePath,
     )
     // Optional live end-to-end post (SignedFallEventTest); unset = skipped.
     for (name in listOf("server", "agentId", "secret", "cameraId", "seq")) {
@@ -100,6 +103,6 @@ tasks.withType<Test>().configureEach {
     }
     systemProperty(
         "mantau.protocol.examples",
-        rootProject.file("../../protocol/examples").absolutePath,
+        rootProject.file("../protocol/examples").absolutePath,
     )
 }

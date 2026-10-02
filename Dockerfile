@@ -20,7 +20,7 @@ COPY mantau-AI /app/mantau-AI
 COPY mantau-core /app/mantau-core
 COPY mantau-agent /app/agent
 # Golden protocol examples: only the contract tests read them.
-COPY protocol/examples /app/protocol/examples
+COPY mantau-agent/protocol/examples /app/agent/protocol/examples
 
 RUN pip install --no-cache-dir -e /app/mantau-AI \
  && pip install --no-cache-dir -e /app/mantau-core \
