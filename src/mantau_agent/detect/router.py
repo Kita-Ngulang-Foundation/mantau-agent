@@ -77,6 +77,8 @@ class InferenceRouter:
         self.synthetic_events_suppressed = 0
         self._detector_ok = detector is not None and not isinstance(detector, NullDetector)
         self._last_attempt: dict[str, float] = {}
+        self._live_slots = asyncio.Semaphore(3)
+        self._live_tasks: set[asyncio.Task] = set()
         self._last_ts: int | None = None
         self._tasks: list[asyncio.Task] = []
         self._running = False
@@ -222,12 +224,31 @@ class InferenceRouter:
         # Failures and mode transitions do not reset this attempt budget.
         self._last_attempt[name] = self._clock()
         if name == "live":
-            request = self.frame_uplink.push(jpeg)
+            # A round trip to the server is longer than a video frame
+            # interval, so several live frames are in flight at once.
+            await self._live_slots.acquire()
+            task = asyncio.create_task(self._push_live(jpeg))
+            self._live_tasks.add(task)
+            task.add_done_callback(self._live_tasks.discard)
+            return
         else:
             request = self.inference_uplink.submit(
                 jpeg, camera_id=self.camera_id, ts_ms=work.ts_ms, event_ids=work.event_ids)
         if not await asyncio.wait_for(request, timeout=self.upload_timeout_s):
             self.upload_failures[name] += 1
+
+    async def _push_live(self, jpeg: bytes) -> None:
+        try:
+            pushed = await asyncio.wait_for(
+                self.frame_uplink.push(jpeg, captured_at_ms=int(time.time() * 1000)),
+                timeout=self.upload_timeout_s)
+            if not pushed:
+                self.upload_failures["live"] += 1
+        except Exception as exc:  # noqa: BLE001 -- a lost frame is just dropped
+            self.upload_failures["live"] += 1
+            self.last_error = f"live: {type(exc).__name__}"
+        finally:
+            self._live_slots.release()
 
     def _live_rate(self) -> float:
         current = getattr(self.frame_uplink, "current_fps", None)
@@ -244,6 +265,8 @@ class InferenceRouter:
         # Detection can enqueue confirmations, so drain it before cloud.
         for queue in self._queues.values():
             await queue.join()
+        if self._live_tasks:
+            await asyncio.gather(*list(self._live_tasks), return_exceptions=True)
 
     async def change_mode(self, mode: InferenceMode) -> None:
         async with self._lifecycle_lock:

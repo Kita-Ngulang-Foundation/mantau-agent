@@ -77,18 +77,21 @@ class FrameUplink:
             hashlib.sha256,
         ).hexdigest()
 
-    async def push(self, jpeg: bytes) -> bool:
+    async def push(self, jpeg: bytes, captured_at_ms: int | None = None) -> bool:
         if len(jpeg) > self._max_bytes:
             return False
+        headers = {
+            "Content-Type": "image/jpeg",
+            "X-Mantau-Agent": self.agent_id,
+            "X-Mantau-Signature": self._signature(jpeg),
+        }
+        if captured_at_ms is not None:
+            # Lets the server drop a frame that overtook a newer one.
+            headers["X-Mantau-Captured-At"] = str(captured_at_ms)
         try:
             resp = await self._client.post(
                 f"{self.server_url}/cameras/{self.camera_id}/frame",
-                content=jpeg,
-                headers={
-                    "Content-Type": "image/jpeg",
-                    "X-Mantau-Agent": self.agent_id,
-                    "X-Mantau-Signature": self._signature(jpeg),
-                },
+                content=jpeg, headers=headers,
             )
             resp.raise_for_status()
         except httpx.HTTPError:
