@@ -148,8 +148,8 @@ class InferenceRouter:
                 self._enqueue("detection", work)
         elif self.inference_uplink is not None and self._cloud_sampler.should_keep(ts_ms):
             self._enqueue("cloud", work)
-        if (self.mode != InferenceMode.EDGE and self.live_view_enabled
-                and self._live_sampler.should_keep(ts_ms)):
+        # Live view in every mode: family members watch whatever the camera sees.
+        if self.live_view_enabled and self._live_sampler.should_keep(ts_ms):
             self._enqueue("live", work)
 
     async def _worker(self, name: str) -> None:
@@ -207,7 +207,7 @@ class InferenceRouter:
             self._enqueue("cloud", FrameWork(work.image, work.ts_ms, tuple(production)))
 
     async def _upload(self, name: str, work: FrameWork) -> None:
-        rate = (self.live_view_fps if name == "live" else
+        rate = (self._live_rate() if name == "live" else
                 min(self.cloud_upload_fps, self.confirmation_fps)
                 if self.mode == InferenceMode.HYBRID else self.cloud_upload_fps)
         now = self._clock()
@@ -228,6 +228,10 @@ class InferenceRouter:
                 jpeg, camera_id=self.camera_id, ts_ms=work.ts_ms, event_ids=work.event_ids)
         if not await asyncio.wait_for(request, timeout=self.upload_timeout_s):
             self.upload_failures[name] += 1
+
+    def _live_rate(self) -> float:
+        current = getattr(self.frame_uplink, "current_fps", None)
+        return min(self.live_view_fps, current()) if callable(current) else self.live_view_fps
 
     def _discard_pending(self) -> None:
         for name, queue in self._queues.items():

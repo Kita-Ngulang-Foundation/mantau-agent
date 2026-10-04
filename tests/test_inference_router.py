@@ -65,22 +65,24 @@ async def rig():
         detector = kwargs.pop("detector", Detector())
         events = kwargs.pop("event_uplink", Events())
         cloud = kwargs.pop("inference_uplink", Cloud())
+        viewers = kwargs.pop("viewers", 1)
         live = []
+        now = [0.0]
 
         def handler(request):
             live.append(request)
-            return httpx.Response(204)
+            return httpx.Response(204, headers={"X-Mantau-Live-Viewers": str(viewers)})
 
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         clients.append(client)
-        frames = FrameUplink("http://server", "agent", "secret", "cam", client=client)
+        frames = FrameUplink("http://server", "agent", "secret", "cam", client=client,
+                             clock=lambda: now[0])
         capabilities = kwargs.pop("capabilities", CapabilityReport(
             platform=PlatformType.LINUX_X86_64, architecture="x86_64", cpu="test",
             cpu_count=4, memory_bytes=1024**3, software_version="test",
             detector_backend="mediapipe", supported_detector_backends=["null", "mediapipe"],
             detector_fps=20, cloud_available=cloud is not None,
         ))
-        now = [0.0]
         router = InferenceRouter(
             camera_id="cam", detector=detector, event_uplink=events, frame_uplink=frames,
             capabilities=capabilities, mode=mode, inference_uplink=cloud,
@@ -103,13 +105,22 @@ async def feed(router, now, timestamps):
         await router.wait_idle()
 
 
-async def test_edge_sends_events_only_even_when_live_view_enabled(rig):
+async def test_edge_detects_locally_and_still_serves_live_view(rig):
     router, detector, events, cloud, live, now = rig()
     await router.start()
     await feed(router, now, [0, 100, 200])
     assert detector.calls == [0, 200]
     assert len(events.events) == 2
-    assert cloud.calls == live == []
+    assert cloud.calls == []
+    assert len(live) == 1
+
+
+async def test_live_view_idles_until_someone_watches(rig):
+    router, _, _, _, live, now = rig(Mode.CLOUD, live_view_fps=10, viewers=0)
+    await router.start()
+    await feed(router, now, range(0, 2001, 100))
+    # Nobody watching: one frame a second keeps the snapshot fresh.
+    assert len(live) == 3
 
 
 async def test_cloud_skips_detector_and_reuses_jpeg_encoder(rig):

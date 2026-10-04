@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import time
 
 import cv2
 import httpx
@@ -28,22 +29,33 @@ class FrameUplink:
         secret: str,
         camera_id: str,
         *,
-        fps: float = 4.0,
+        fps: float = 10.0,
+        idle_fps: float = 1.0,
+        live_hold_s: float = 5.0,
         jpeg_quality: int = 70,
         max_width: int = 640,
         max_bytes: int = 256 * 1024,
         client: httpx.AsyncClient | None = None,
+        clock=time.monotonic,
     ) -> None:
         self.server_url = server_url.rstrip("/")
         self.agent_id = agent_id
         self._secret = secret
         self.camera_id = camera_id
-        self._interval_s = 1.0 / fps if fps > 0 else 0.0
+        self.fps = fps
+        self.idle_fps = min(idle_fps, fps)
+        self._live_hold_s = live_hold_s
+        self._live_until = float("-inf")
+        self._clock = clock
         self._jpeg_quality = jpeg_quality
         self._max_width = max_width
         self._max_bytes = max_bytes
         self._client = client or httpx.AsyncClient(timeout=5.0)
         self._owns_client = client is None
+
+    def current_fps(self) -> float:
+        """Video rate while the server reported a viewer recently, else idle."""
+        return self.fps if self._clock() < self._live_until else self.idle_fps
 
     def encode(self, image) -> bytes | None:
         # Detection doesn't need 1080p and neither does a phone screen -- the
@@ -81,6 +93,12 @@ class FrameUplink:
             resp.raise_for_status()
         except httpx.HTTPError:
             return False
+        try:
+            viewers = int(resp.headers.get("X-Mantau-Live-Viewers", "0"))
+        except ValueError:
+            viewers = 0
+        if viewers > 0:
+            self._live_until = self._clock() + self._live_hold_s
         return True
 
     async def run(self, puller: CameraPuller, *, stop_event: asyncio.Event) -> None:
@@ -91,7 +109,7 @@ class FrameUplink:
                 if jpeg is not None:
                     await self.push(jpeg)
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=self._interval_s)
+                await asyncio.wait_for(stop_event.wait(), timeout=1.0 / self.current_fps())
             except TimeoutError:
                 continue
 
