@@ -30,8 +30,12 @@ class Settings(CoreSettings):
 
     # -- server connection ---------------------------------------------------
     server_url: str = "http://localhost:8100"
-    agent_id: str = ""      # set via MANTAU_AGENT_ID, from POST /agents/enroll
-    agent_secret: str = ""  # set via MANTAU_AGENT_SECRET, from the same call
+    agent_id: str = ""      # saved by enrollment (POST /agents/enroll)
+    agent_secret: str = ""  # saved by the same call; never typed by anyone
+    # Single-use key from the Mantau app. With no saved enrollment, `run`
+    # enrolls with it once (unattended Docker installs).
+    enrollment_key: str = Field(default="", repr=False)
+    device_name: str = ""
 
     # -- camera: manual config path (ONVIF discovery picks its own CameraRef) -
     camera_id: str = "cam-1"
@@ -64,10 +68,6 @@ class Settings(CoreSettings):
     hybrid_confirmation_fps: float = Field(default=0.2, gt=0, allow_inf_nan=False)
     frame_queue_size: int = Field(default=2, ge=1)
     upload_timeout_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)
-    # None = never fire a synthetic fall. Notifications are supposed to mean a
-    # real fall happened, so the default detector stays silent until a real
-    # model is wired in; set a frame count only when demoing the alert path.
-    null_detector_trigger_every: int | None = None
     sampler_keep_every_n: int = Field(default=1, ge=1)
     sampler_max_fps: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     poll_interval_s: float = Field(default=0.02, gt=0, allow_inf_nan=False)
@@ -80,7 +80,10 @@ class Settings(CoreSettings):
     clip_post_s: float = Field(default=5.0, ge=1, le=30)
     clip_spool_dir: str = "data/clips"
     live_view_enabled: bool = True
-    live_view_fps: float = Field(default=4.0, gt=0, allow_inf_nan=False)
+    # Video rate while someone watches (the server says so on each upload);
+    # the idle rate keeps the snapshot fresh for the zone editor.
+    live_view_fps: float = Field(default=10.0, gt=0, le=15, allow_inf_nan=False)
+    live_view_idle_fps: float = Field(default=1.0, gt=0, le=2, allow_inf_nan=False)
     live_view_jpeg_quality: int = 70
     live_view_max_width: int = 640
 

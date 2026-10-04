@@ -47,66 +47,77 @@ class AgentIdTaken(RuntimeError):
     """Another agent already enrolled under this id (HTTP 409)."""
 
 
-class AlreadyClaimed(RuntimeError):
-    """The agent belongs to a household; it gets no more claim codes."""
+class EnrollmentKeyRejected(RuntimeError):
+    """The server refused the enrollment key: unknown, expired, revoked, or
+    already used (HTTP 401). The owner creates a new one in the Mantau app."""
 
 
-def _proof(agent_id: str, secret: str) -> dict[str, str]:
-    return {"X-Mantau-Agent-ID": agent_id, "X-Mantau-Agent-Secret": secret}
+def local_platform() -> str:
+    import os
+    import platform
+
+    from .capabilities import _read, classify_platform
+
+    return classify_platform(
+        platform.system(), platform.machine().lower(),
+        model=_read("/proc/device-tree/model"),
+        android=bool(os.environ.get("ANDROID_ROOT")),
+    ).value
 
 
-def enroll(server_url: str, agent_id: str, *, current_secret: str | None = None,
+def enroll(server_url: str, enrollment_key: str, agent_id: str, *, name: str | None = None,
            client: httpx.Client | None = None) -> str:
-    """Enroll a new identity, or rotate this one's secret when
-    `current_secret` proves it. Returns the new secret; prints a claim code
-    when the agent is still unclaimed. Never prints the secret."""
+    """Join the household that created `enrollment_key` as `agent_id`.
+    Returns this agent's own secret. Never prints the key or the secret."""
     owns_client = client is None
     client = client or httpx.Client(timeout=10.0)
     try:
-        resp = client.post(
-            f"{server_url.rstrip('/')}/agents/enroll", json={"agent_id": agent_id},
-            headers=_proof(agent_id, current_secret) if current_secret else None,
-        )
+        resp = client.post(f"{server_url.rstrip('/')}/agents/enroll", json={
+            "enrollment_key": enrollment_key.strip(), "agent_id": agent_id,
+            "name": name or agent_id, "platform": local_platform(),
+        })
         if resp.status_code == 409:
             raise AgentIdTaken(agent_id)
+        if resp.status_code in (401, 422):
+            raise EnrollmentKeyRejected(
+                "The enrollment key was not accepted (wrong, expired, or already used). "
+                "Create a new one in the Mantau app: Beranda > Tambah perangkat.")
         resp.raise_for_status()
-        if resp.json().get("claim_code"):
-            print(f"Claim code: {resp.json()['claim_code']}")
         return resp.json()["secret"]
     finally:
         if owns_client:
             client.close()
 
 
-def refresh_claim_code(server_url: str, agent_id: str, secret: str, *,
-                       client: httpx.Client | None = None) -> str:
-    """A fresh single-use claim code. Does not change the agent secret."""
-    owns_client = client is None
-    client = client or httpx.Client(timeout=10.0)
+def enroll_device(server_url: str, enrollment_key: str, *, name: str | None = None,
+                  client: httpx.Client | None = None) -> EnrollmentConfiguration:
+    """Enroll under a fresh generated id, retrying the rare id collision."""
+    for _ in range(3):
+        agent_id = default_agent_id()
+        try:
+            secret = enroll(server_url, enrollment_key, agent_id, name=name, client=client)
+        except AgentIdTaken:
+            continue
+        return EnrollmentConfiguration(server_url=server_url.rstrip("/"), agent_id=agent_id,
+                                       agent_secret=secret)
+    raise RuntimeError("Enrollment failed: could not pick an unused device id")
+
+
+def enroll_and_save(store: ConfigurationStore, server_url: str, enrollment_key: str, *,
+                    name: str | None = None,
+                    client: httpx.Client | None = None) -> AgentConfiguration:
+    """Enroll and persist immediately, so an interrupted camera step never
+    enrolls the same device twice. Camera setup then continues from the app."""
     try:
-        resp = client.post(f"{server_url.rstrip('/')}/agent-control/claim-code",
-                           headers=_proof(agent_id, secret))
-        if resp.status_code == 409:
-            raise AlreadyClaimed(agent_id)
-        resp.raise_for_status()
-        return resp.json()["claim_code"]
-    finally:
-        if owns_client:
-            client.close()
-
-
-def rotate_secret(store: ConfigurationStore, *, client: httpx.Client | None = None) -> None:
-    """Replace the saved secret, proving the current one. Household
-    ownership is unchanged; the old secret stops working immediately."""
-    configuration = store.load()
-    if configuration is None or not configuration.enrollment.agent_secret:
-        raise RuntimeError("This agent is not enrolled yet; run `mantau-agent setup`.")
-    enrollment = configuration.enrollment
-    secret = enroll(enrollment.server_url, enrollment.agent_id,
-                    current_secret=enrollment.agent_secret, client=client)
-    store.save(configuration.model_copy(update={
-        "enrollment": enrollment.model_copy(update={"agent_secret": secret}),
-    }))
+        enrollment = enroll_device(server_url, enrollment_key, name=name, client=client)
+    except (httpx.HTTPError, KeyError, ValueError) as exc:
+        raise RuntimeError(f"Enrollment failed: {type(exc).__name__}") from exc
+    configuration = AgentConfiguration(
+        setup_state=SetupState.ENROLLED, enrollment=enrollment,
+        inference_mode=InferenceMode.CLOUD,
+    )
+    store.save(configuration)
+    return configuration
 
 
 def render_env_file(*, server_url: str, agent_id: str, secret: str, camera: dict) -> str:
@@ -214,50 +225,52 @@ async def _pick_camera_interactive(agent_id: str) -> CameraConfiguration:
 
 _NON_INTERACTIVE_MESSAGE = (
     "Setup is incomplete and requires an interactive terminal. Run "
-    "`mantau-agent setup` once, or provide MANTAU_AGENT_ID, "
-    "MANTAU_AGENT_SECRET, and MANTAU_CAMERA_HOST for Docker/CI."
+    "`mantau-agent setup` once, run `mantau-agent setup --remote --key <enrollment key>`, "
+    "or set MANTAU_ENROLLMENT_KEY for Docker."
 )
 
 
-def run_wizard(store: ConfigurationStore | None = None, *, remote: bool = False) -> AgentConfiguration:
+def default_device_name() -> str:
+    return (socket.gethostname() or "Mantau agent")[:60]
+
+
+def run_wizard(store: ConfigurationStore | None = None, *, remote: bool = False,
+               server_url: str | None = None, enrollment_key: str | None = None,
+               name: str | None = None) -> AgentConfiguration:
+    """Enroll with an enrollment key from the Mantau app, then (unless
+    `remote`) pick and validate the camera here. With `remote` and every
+    answer supplied, no terminal is needed."""
     store = store or ConfigurationStore()
-    if not sys.stdin.isatty():
+    unattended = remote and bool(server_url and enrollment_key)
+    if not unattended and not sys.stdin.isatty():
         raise RuntimeError(_NON_INTERACTIVE_MESSAGE)
     existing = store.load()
-    print("=== Mantau agent setup ===\n")
+    if not unattended:
+        print("=== Mantau agent setup ===\n")
     try:
         if existing is not None and existing.enrollment.agent_secret:
-            enrollment = existing.enrollment
-            print(f"Reusing enrollment for {enrollment.agent_id!r}.")
+            configuration = existing
+            print(f"Already enrolled as {existing.enrollment.agent_id!r}.")
         else:
-            server_url = _prompt("Mantau server URL", default="http://localhost:8100")
-            while True:
-                agent_id = _prompt("A name for this device", default=default_agent_id())
-                print(f"Registering {agent_id!r} with the server...")
-                try:
-                    secret = enroll(server_url, agent_id)
-                    break
-                except AgentIdTaken:
-                    print("That name is already used by another device; choose another.")
-                except (httpx.HTTPError, KeyError, ValueError) as exc:
-                    raise RuntimeError(f"Enrollment failed: {type(exc).__name__}") from exc
-            enrollment = EnrollmentConfiguration(
-                server_url=server_url, agent_id=agent_id, agent_secret=secret)
-            store.save(AgentConfiguration(
-                setup_state=SetupState.ENROLLED, enrollment=enrollment,
-                inference_mode=InferenceMode.CLOUD,
-            ))
+            url = server_url or _prompt("Mantau server URL", default="https://")
+            if not unattended:
+                print("In the Mantau app open Beranda > Tambah perangkat to get an enrollment key.")
+            key = enrollment_key or _prompt("Enrollment key")
+            device_name = name or (default_device_name() if unattended
+                                   else _prompt("Device name", default=default_device_name()))
+            print("Registering this device with your household...")
+            configuration = enroll_and_save(store, url, key, name=device_name)
+            print(f"Enrolled as {configuration.enrollment.agent_id!r}.")
         if remote:
-            configuration = existing or store.load()
-            print("Enter the claim code in Mantau app, then start `mantau-agent run` to finish camera setup from the phone.")
+            print("Start the service (`mantau-agent run`), then finish camera setup in the Mantau app.")
             return configuration
-        camera = asyncio.run(_pick_camera_interactive(enrollment.agent_id))
+        camera = asyncio.run(_pick_camera_interactive(configuration.enrollment.agent_id))
         inference_mode = InferenceMode.CLOUD
         print("Inference runs on the Mantau server (CLOUD).")
     except (EOFError, KeyboardInterrupt) as exc:
         raise RuntimeError("Setup cancelled; saved enrollment can be resumed") from exc
     configuration = AgentConfiguration(
-        setup_state=SetupState.COMPLETE, enrollment=enrollment,
+        setup_state=SetupState.COMPLETE, enrollment=configuration.enrollment,
         camera=camera, inference_mode=inference_mode,
     )
     store.save(configuration)

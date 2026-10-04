@@ -7,7 +7,7 @@ contract:
 - the native Kotlin Android Agent under `android-agent/` for a spare phone that
   remains at home on the CCTV LAN.
 
-Both use the shared claim, agent ID, capability, health, camera, command, and
+Both use the shared enrollment, agent ID, capability, health, camera, command, and
 inference-mode wire models from `mantau-core`. Android reports platform
 `android`. The Android Agent is not `mantau-app`; RTSP, ONVIF, and monitoring
 remain outside the Flutter control app.
@@ -72,9 +72,11 @@ installed systemd unit uses `Restart=always`, so remote restart/reconfigure
 commands can exit cleanly and be relaunched (an explicit `systemctl stop` is
 still respected):
 
-1. Enter the Mantau server URL and device name. Enrollment is persisted
-   immediately, so an interrupted camera step does not enroll the same agent
-   again.
+1. Enter the Mantau server URL, the **enrollment key** from the Mantau app
+   (Beranda > Tambah perangkat; single use, valid for an hour), and a device
+   name. The agent joins that household under a generated id and stores its
+   own secret; nobody types or sees the secret. Enrollment is persisted
+   immediately, so an interrupted camera step does not enroll again.
 2. ONVIF discovery deduplicates devices by host and probes each one over RTSP.
    A single result is offered directly. Multiple results always require an
    explicit numbered choice; Enter never silently selects the first camera.
@@ -115,27 +117,11 @@ sudo sh packaging/uninstall.sh
 Only `packaging/uninstall.sh --purge` removes `/etc/mantau-agent`,
 `/var/lib/mantau-agent`, and the service account.
 
-## Android Agent installation
+## Android Agent
 
-Build the independent native project with Android SDK 36 and JDK 17 or 21:
-
-```powershell
-cd android-agent
-.\gradlew.bat testDebugUnitTest assembleDebug
-adb install -r app\build\outputs\apk\debug\app-debug.apk
-```
-
-Open **Mantau Agent** on the spare Android 8.0+ phone, enter the server URL and
-device name, enroll, then copy its claim code into `mantau-app`. Discover ONVIF
-cameras only while the phone is connected to the CCTV Wi-Fi, or use manual
-IP/RTSP configuration. Select a substream path when available, save, grant the
-notification permission, and start the foreground monitoring service.
-
-Android identity/configuration is stored in private app storage; agent/camera
-secrets and in-flight credential-bearing commands are encrypted with an Android
-Keystore AES-GCM key. The persistent notification reports failure/degraded
-state without credentials. See `android-agent/README.md` for Android build,
-installation, permission, security, RTSP, and hardware-test details.
+The native Android Agent lives in its own repository, `mantau-android-agent`,
+with its own build, tests, and APK releases. Installation, permissions,
+security, and RTSP details are in that repository's README.
 
 ## Camera setup behavior
 
@@ -184,14 +170,22 @@ The agent does not log agent secrets or camera passwords. Its status and
 discovery JSON contain no credentials. Linux directory/file permissions are
 the confidentiality boundary; protect device administrator access and backups.
 
-Existing `MANTAU_*` environment variables and `.env` files remain supported for
-Docker and CI. Explicit environment values override durable state. A fully
-environment-configured process does not require `config.json`:
+Unattended enrollment, without prompts:
+
+```sh
+mantau-agent --server-url https://server.example setup --remote \
+  --key MTU-XXXXX-XXXXX-XXXXX-XXXXX --name "Ruang tamu"
+```
+
+For Docker, set `MANTAU_ENROLLMENT_KEY` (plus `MANTAU_SERVER_URL`, optionally
+`MANTAU_DEVICE_NAME`): the first `run` with no saved enrollment enrolls once
+and writes `config.json`; camera setup then continues from the app. Explicit
+environment values override durable state, and a process whose camera is
+configured by environment does not need camera setup from the app:
 
 ```sh
 MANTAU_SERVER_URL=http://server:8100 \
-MANTAU_AGENT_ID=agent-1 \
-MANTAU_AGENT_SECRET='<secret>' \
+MANTAU_ENROLLMENT_KEY=MTU-XXXXX-XXXXX-XXXXX-XXXXX \
 MANTAU_CAMERA_ID=cam-1 \
 MANTAU_CAMERA_HOST=192.168.1.42 \
 MANTAU_CAMERA_SUB_PATH=/stream2 \
@@ -206,7 +200,8 @@ The principal runtime variables are:
 |---|---|---|
 | `MANTAU_CONFIG_PATH` | `data/config.json` | Durable setup state path used by CLI/default run |
 | `MANTAU_SERVER_URL` | `http://localhost:8100` | Server base URL |
-| `MANTAU_AGENT_ID`, `MANTAU_AGENT_SECRET` | empty | Enrollment identity |
+| `MANTAU_ENROLLMENT_KEY`, `MANTAU_DEVICE_NAME` | empty | One-time enrollment for unattended installs |
+| `MANTAU_AGENT_ID`, `MANTAU_AGENT_SECRET` | from `config.json` | Saved by enrollment; override only to reuse an existing identity |
 | `MANTAU_CAMERA_HOST`, `MANTAU_CAMERA_PORT` | empty, `554` | Manual/discovery fallback |
 | `MANTAU_CAMERA_MAIN_PATH`, `MANTAU_CAMERA_SUB_PATH` | `/stream1`, unset | RTSP profiles |
 | `MANTAU_DEFAULT_STREAM_PROFILE` | `sub` | Preferred profile; core falls back to main if no sub path exists |
