@@ -16,6 +16,7 @@ RestartSec=5
 TimeoutStopSec=20
 Environment=MANTAU_SEQ_PATH=/var/lib/mantau-agent/seq.txt
 Environment=MANTAU_SPOOL_PATH=/var/lib/mantau-agent/spool.db
+Environment=MANTAU_CLIP_SPOOL_DIR=/var/lib/mantau-agent/clips
 Environment=MANTAU_STATUS_PATH=/var/lib/mantau-agent/status.json
 Environment=MANTAU_COMMAND_STATE_PATH=/var/lib/mantau-agent/commands.json
 Environment=PYTHONUNBUFFERED=1

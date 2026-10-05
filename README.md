@@ -4,7 +4,7 @@ Mantau has two separate installable agent runtimes with one control-plane
 contract:
 
 - the Python agent for unattended Linux and 64-bit Raspberry Pi devices;
-- the native Kotlin Android Agent under `android-agent/` for a spare phone that
+- the native Kotlin Android Agent in the separate `mantau-android-agent` repository for a spare phone that
   remains at home on the CCTV LAN.
 
 Both use the shared enrollment, agent ID, capability, health, camera, command, and
@@ -34,10 +34,10 @@ the same v1 control payloads, signed live-frame protocol, envelope signatures,
 and golden fixtures. Both running agents use CLOUD inference only. They do not
 initialize local fall models or emit local detection events. The server runs
 the fall and activity rules on signed sampled frames. Existing EDGE/HYBRID
-implementations and fixtures remain in source but are disabled in the agent
-runtimes. If server inference is unavailable, Linux startup fails so systemd
-can retry; Android reports degraded monitoring and discards frames until the
-server capability returns.
+values in stored configurations remain readable and resolve to CLOUD.
+If server inference is unavailable, both agents keep control/configuration
+available and report degraded monitoring. Capability probing and fresh-frame
+retries recover cloud inference without reenrollment.
 
 ### Activity rules
 
@@ -46,7 +46,9 @@ observations, without extra models: prolonged position (on the floor, or
 anywhere outside a seating/bed zone), nocturnal movement (repeated bed exits
 or time out of bed inside the night window) and bathroom duration (someone
 entered the bathroom-door zone and has not been seen since). Each raises a
-warning and later a critical event with its own `kind`, deduplicated by a
+warning and later a critical event with its own `kind`, except floor stillness
+which emits one critical event at its saved threshold (30 seconds for new/reset
+settings). Events are deduplicated by a
 stable event id; signals carry only durations, movement, counts and
 confidence, never images or identities. Timers pause while the camera is
 disconnected, the person is lost or confidence is low. Thresholds, the night
@@ -77,7 +79,11 @@ still respected):
    name. The agent joins that household under a generated id and stores its
    own secret; nobody types or sees the secret. Enrollment is persisted
    immediately, so an interrupted camera step does not enroll again.
-2. ONVIF discovery deduplicates devices by host and probes each one over RTSP.
+2. Normal installation uses `setup --remote`: finish camera discovery/manual
+   entry, credentials and validation in the family app. Credentials are entered
+   once and delivered to the agent in an authenticated durable command.
+   The following local steps describe advanced standalone `setup` only.
+   ONVIF discovery deduplicates devices by host and probes each one over RTSP.
    A single result is offered directly. Multiple results always require an
    explicit numbered choice; Enter never silently selects the first camera.
 3. Use the manual address option for cameras without ONVIF or when multicast is
@@ -92,7 +98,7 @@ still respected):
 After installation and configuration, routine operation requires no SSH or
 interactive login. systemd starts the agent at boot and restarts it after a
 failure; camera and frame-upload outages are retried internally. If server
-inference is unavailable at startup, systemd retries the agent. Configuration,
+inference is unavailable at startup, the agent stays degraded and probes recovery. Configuration,
 sequence state, acknowledged spool state, and health survive service restarts.
 
 Useful local service commands are:
@@ -270,7 +276,7 @@ server's `max_frame_age_s`, and never spooled.
 Latency budget (CLOUD): the fall rules confirm a fall after the person has been
 on the ground for 1 s, so landing-to-alert is that second plus the time from
 capturing the confirming frame to the push request. Measured on a LAN with the
-simulated camera (17 falls, real MediaPipe on the server): capture to push
+simulated camera (17 falls, the real pose detector on the server): capture to push
 request median 87 ms, p95 99 ms, max 109 ms, i.e. about 1.1 s from landing.
 Budget: 2 s from landing to push request on the local network, leaving the rest
 of the 5 s target for WAN upload and FCM delivery. Sequential uploads reached
@@ -292,14 +298,15 @@ monotonic sequence counter prevents reuse across clean restarts.
 capture. It reports:
 
 - camera connectivity, last frame time, last error, and reconnect count;
-- effective inference mode and detector backend/liveness;
+- requested and effective inference mode (always CLOUD) and whether server
+  inference is available;
 - uplink connectivity, last error, and last successful server contact;
 - spool depth, queue/drop/upload details, version, PID, start time, and uptime.
 
 If the recorded PID no longer exists, the command marks the snapshot stopped
 and clears camera/uplink connectivity rather than reporting stale liveness.
 
-Shutdown stops admission, drains active detector/event work, interrupts retry
+Shutdown stops admission, drains active uploads, interrupts retry
 waits, releases RTSP/native resources, writes a stopped status snapshot, closes
 HTTP and SQLite, and lowers the tunnel. Pending envelopes and acknowledged
 state remain durable for the next systemd start.
@@ -329,13 +336,13 @@ py -3.12 -m venv .venv
 .venv\Scripts\python.exe -m pytest tests -q
 ```
 
-The suite uses local sockets, mock HTTP, injected captures/detectors, and real
-SQLite files. It covers discovery deduplication and ambiguity, RTSP validation,
-configuration interruption/corruption/rollback, environment precedence,
-queue/rate behavior, every inference mode, prompt outage recovery, durable
+The suite uses local sockets, mock HTTP, injected captures and inference
+uplinks, and real SQLite files. It covers discovery deduplication and ambiguity,
+RTSP validation, configuration interruption/corruption/rollback, environment
+precedence, queue/rate behavior, CLOUD routing, prompt outage recovery, durable
 acknowledgements, JSON status/discovery, shutdown, and packaging invariants.
 
-Hardware ONVIF multicast, real camera credential variants, MediaPipe model
-accuracy/sustained throughput, Tailscale, systemd execution on an actual Linux
+Hardware ONVIF multicast, real camera credential variants, sustained upload
+throughput to the server, Tailscale, systemd execution on an actual Linux
 host, and cross-built binaries require target/integration verification. Build
 and packaging commands are documented in `packaging/README.md`.

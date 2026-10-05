@@ -15,6 +15,10 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import math
+import os
+import re
+import time
 import shutil
 import subprocess
 import tempfile
@@ -29,7 +33,8 @@ from mantau_core.contracts import EventKind, FallEvent
 log = logging.getLogger(__name__)
 
 # Server answers that retrying can never fix.
-_PERMANENT = {400, 401, 403, 404, 413, 415}
+# A clip can reach the server before its event; 404 must be retried.
+_PERMANENT = {400, 401, 403, 413, 415}
 
 
 def encode_mp4(frames: list[bytes], fps: float) -> bytes:
@@ -100,7 +105,7 @@ class ClipUploader:
             )
         except httpx.HTTPError:
             return False
-        if response.status_code == 204:
+        if response.status_code in (200, 204):
             return True
         return None if response.status_code in _PERMANENT else False
 
@@ -114,16 +119,26 @@ class _Capture:
     event_id: str
     frames: list[bytes]
     remaining: int
+    generation: int = 0
 
 
 class ClipRecorder:
     def __init__(self, *, uploader: ClipUploader, encode_jpeg: Callable[[object], bytes | None],
                  spool_dir: str | Path, fps: float = 5.0, pre_s: float = 5.0,
                  post_s: float = 5.0, max_pending_files: int = 50,
-                 retry_interval_s: float = 60.0) -> None:
+                 retry_interval_s: float = 60.0, max_spool_bytes: int = 100 * 1024 * 1024,
+                 max_spool_age_s: float = 24 * 60 * 60, max_pending_captures: int = 8,
+                 max_encoding_tasks: int = 2, wall_clock: Callable[[], float] = time.time) -> None:
+        if any(not math.isfinite(value) or value <= 0
+               for value in (fps, pre_s, post_s, retry_interval_s, max_spool_age_s)):
+            raise ValueError("Clip rates, durations and retry interval must be positive and finite")
+        if min(max_pending_files, max_spool_bytes, max_pending_captures, max_encoding_tasks) < 1:
+            raise ValueError("Clip storage and work limits must be positive")
         self.uploader = uploader
         self.encode_jpeg = encode_jpeg
-        self.spool_dir = Path(spool_dir)
+        # The caller chooses the writable directory, including the systemd unit's
+        # service-owned path. Relative development paths follow the working directory.
+        self.spool_dir = Path(spool_dir).expanduser().resolve()
         self.fps = fps
         self._interval_ms = 1000.0 / fps
         self._ring: deque[bytes] = deque(maxlen=max(1, round(pre_s * fps)))
@@ -132,14 +147,52 @@ class ClipRecorder:
         self._last_ts: int | None = None
         self._tasks: set[asyncio.Task] = set()
         self._max_pending = max_pending_files
+        self._max_spool_bytes = max_spool_bytes
+        self._max_spool_age_s = max_spool_age_s
+        self._max_captures = max_pending_captures
+        self._max_encoding_tasks = max_encoding_tasks
         self._retry_interval_s = retry_interval_s
         self._retry_task: asyncio.Task | None = None
+        self._wall = wall_clock
+        self._generation = 0
+        self._seen: dict[str, None] = {}
         self.uploaded = 0
         self.failed = 0
+        self.expired = 0
+        self.evicted_capacity = 0
+        self.retry_failures = 0
+        self.persistence_failures = 0
+        self.last_error: str | None = None
+        self._closed = False
+        try:
+            self.spool_dir.mkdir(parents=True, exist_ok=True)
+            # Incomplete writes from a crashed process cannot be playable clips.
+            for partial in self.spool_dir.glob("*.part"):
+                partial.unlink(missing_ok=True)
+            self._maintain_spool()
+        except OSError as exc:
+            self._failure("spool_init", exc, persistence=True)
+
+    def _failure(self, stage: str, exc: Exception, *, persistence: bool = False) -> None:
+        self.failed += 1
+        self.persistence_failures += int(persistence)
+        self.last_error = f"{stage}: {type(exc).__name__}"
+        log.warning("clip operation failed (%s)", self.last_error)
+
+    def clear_capture(self) -> None:
+        """Forget the previous camera's ring and unfinished work; keep durable clips.
+
+        Generation checks also discard an encoding result that completes after
+        camera removal. Already stored historical clips retain their retry lifecycle.
+        """
+        self._generation += 1
+        self._ring.clear()
+        self._captures.clear()
+        self._last_ts = None
+        self._seen.clear()
 
     def add_frame(self, image, ts_ms: int) -> None:
-        """Called for every captured frame; keeps only `fps` of them."""
-        if self._last_ts is not None and ts_ms - self._last_ts < self._interval_ms:
+        if self._closed or (self._last_ts is not None and ts_ms - self._last_ts < self._interval_ms):
             return
         jpeg = self.encode_jpeg(image)
         if jpeg is None:
@@ -154,71 +207,152 @@ class ClipRecorder:
                 self._spawn(self._finish(capture))
 
     def on_event(self, event: FallEvent) -> None:
-        if event.kind is EventKind.BATHROOM_DURATION:
+        if self._closed or event.kind is EventKind.BATHROOM_DURATION or event.event_id in self._seen:
             return
-        self._captures.append(_Capture(event.event_id, list(self._ring), self._post_frames))
+        if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}", event.event_id):
+            self._failure("event_id", ValueError("invalid clip identifier"))
+            return
+        self._seen[event.event_id] = None
+        while len(self._seen) > 512:
+            self._seen.pop(next(iter(self._seen)))
+        if len(self._captures) >= self._max_captures:
+            self._failure("capture_capacity", RuntimeError("capture queue full"))
+            return
+        self._captures.append(_Capture(event.event_id, list(self._ring), self._post_frames, self._generation))
 
     def start(self) -> None:
-        if self._retry_task is None:
+        if not self._closed and self._retry_task is None:
             self._retry_task = asyncio.create_task(self._retry_loop(), name="clip-retry")
 
     def health(self) -> dict:
+        try:
+            files = self._spooled()
+            count, size = len(files), sum(path.stat().st_size for path in files)
+        except OSError as exc:
+            self._failure("spool_scan", exc, persistence=True)
+            count, size = None, None
         return {"pending_captures": len(self._captures), "uploaded": self.uploaded,
-                "failed": self.failed, "spooled": len(self._spooled())}
+                "failed": self.failed, "spooled": count, "spooled_bytes": size,
+                "max_spool_bytes": self._max_spool_bytes, "expired": self.expired,
+                "evicted_capacity": self.evicted_capacity, "retry_failures": self.retry_failures,
+                "persistence_failures": self.persistence_failures, "last_error": self.last_error}
 
     def _spawn(self, coroutine) -> None:
+        if len(self._tasks) >= self._max_encoding_tasks:
+            coroutine.close()
+            self._failure("encoding_capacity", RuntimeError("encoding queue full"))
+            return
         task = asyncio.create_task(coroutine)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
     async def _finish(self, capture: _Capture) -> None:
+        if capture.generation != self._generation:
+            return
         try:
             body = await asyncio.to_thread(encode_mp4, capture.frames, self.fps)
-        except Exception as exc:  # noqa: BLE001 -- a clip must never break detection
-            self.failed += 1
-            log.warning("clip for %s not encoded (%s)", capture.event_id, type(exc).__name__)
+        except Exception as exc:  # encoding must never break capture
+            self._failure("encoding", exc)
             return
-        path = self._store(capture.event_id, body)
+        if capture.generation != self._generation:
+            return
+        try:
+            path = self._store(capture.event_id, body)
+        except (OSError, ValueError) as exc:
+            self._failure("persistence", exc, persistence=True)
+            return
         await self._send(path)
 
     def _store(self, event_id: str, body: bytes) -> Path:
+        if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}", event_id):
+            raise ValueError("invalid clip identifier")
+        if not body or len(body) > self._max_spool_bytes:
+            raise ValueError("Encoded clip is empty or exceeds the spool byte limit")
         self.spool_dir.mkdir(parents=True, exist_ok=True)
-        spooled = self._spooled()
-        for old in spooled[: max(0, len(spooled) - self._max_pending + 1)]:
-            old.unlink(missing_ok=True)  # bounded disk: drop the oldest clips first
         path = self.spool_dir / f"{event_id}.mp4"
+        if path.exists():
+            return path  # Keep the durable original if a duplicate event is replayed.
+        spooled = [item for item in self._maintain_spool() if item != path]
+        size = sum(item.stat().st_size for item in spooled)
+        while spooled and (len(spooled) >= self._max_pending or size + len(body) > self._max_spool_bytes):
+            oldest = spooled.pop(0)
+            size -= oldest.stat().st_size
+            oldest.unlink(missing_ok=True)
+            self.evicted_capacity += 1
         partial = path.with_suffix(".part")
-        partial.write_bytes(body)
-        partial.replace(path)
+        try:
+            with partial.open("wb") as output:
+                output.write(body)
+                output.flush()
+                os.fsync(output.fileno())
+            partial.replace(path)
+            if os.name != "nt":
+                directory_fd = os.open(self.spool_dir, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        finally:
+            partial.unlink(missing_ok=True)
+        self.last_error = None
         return path
 
     def _spooled(self) -> list[Path]:
         if not self.spool_dir.exists():
             return []
-        return sorted(self.spool_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
+        return sorted(self.spool_dir.glob("*.mp4"), key=lambda path: (path.stat().st_mtime, path.name))
+
+    def _maintain_spool(self) -> list[Path]:
+        files = self._spooled()
+        cutoff = self._wall() - self._max_spool_age_s
+        retained = []
+        for path in files:
+            if path.stat().st_mtime < cutoff:
+                path.unlink(missing_ok=True)
+                self.expired += 1
+            else:
+                retained.append(path)
+        size = sum(path.stat().st_size for path in retained)
+        while retained and (len(retained) > self._max_pending or size > self._max_spool_bytes):
+            path = retained.pop(0)
+            size -= path.stat().st_size
+            path.unlink(missing_ok=True)
+            self.evicted_capacity += 1
+        return retained
 
     async def _send(self, path: Path) -> None:
-        result = await self.uploader.upload(path.stem, path.read_bytes())
-        if result is True:
-            self.uploaded += 1
-            path.unlink(missing_ok=True)
-        elif result is None:
-            self.failed += 1
-            path.unlink(missing_ok=True)
+        try:
+            result = await self.uploader.upload(path.stem, path.read_bytes())
+            if result is True:
+                self.uploaded += 1
+                path.unlink(missing_ok=True)
+                self.last_error = None
+            elif result is None:
+                self.failed += 1
+                path.unlink(missing_ok=True)
+            else:
+                self.retry_failures += 1
+        except OSError as exc:
+            self._failure("spool_read", exc, persistence=True)
+        except Exception as exc:
+            self._failure("upload", exc)
 
     async def retry_spooled(self) -> None:
-        for path in self._spooled():
+        try:
+            paths = self._maintain_spool()
+        except OSError as exc:
+            self._failure("spool_maintenance", exc, persistence=True)
+            return
+        for path in paths:
             await self._send(path)
 
     async def _retry_loop(self) -> None:
         while True:
-            try:
-                await self.retry_spooled()
-            except Exception as exc:  # noqa: BLE001
-                log.warning("clip retry failed (%s)", type(exc).__name__)
+            await self.retry_spooled()
             await asyncio.sleep(self._retry_interval_s)
 
     async def close(self) -> None:
+        self._closed = True
         if self._retry_task is not None:
             self._retry_task.cancel()
             await asyncio.gather(self._retry_task, return_exceptions=True)

@@ -19,7 +19,8 @@ class HeartbeatLoop:
     """Reads current status via three injected callables at send time, so
     this loop doesn't need to know how "is the camera reachable" or "how
     deep is the spool" are tracked elsewhere (`CameraPuller.reachable`,
-    `EnvelopeSpool.depth`). The pipeline injects the router's detector status;
+    `EnvelopeSpool.depth`). The pipeline injects the router's detector status
+    (always False: the agent runs no detector, the server does);
     defaults remain compatible with existing standalone callers. Rich local
     status is logged separately because core's heartbeat has no such fields."""
 

@@ -116,13 +116,14 @@ class CommandExecutor:
                 "cpu": caps["cpu"],
                 "memory_bytes": caps.get("memory_bytes"),
                 "available_accelerators": caps.get("available_accelerators", []),
-                "supported_detector_backends": caps.get("supported_detector_backends", []),
+                # No detector runs on the agent; the field stays in the contract.
+                "supported_detector_backends": [],
                 "software_version": caps["software_version"],
                 "recommended_mode": caps["recommended_mode"],
                 "supported_inference_modes": caps.get("supported_inference_modes", ["AUTO"]),
                 "recommendation_reason": caps.get("recommendation_reason"),
             },
-            "setup_status": "active" if self.settings.camera_host else "not_started",
+            "setup_status": "active" if not health["routing"].get("degraded", True) else "configuring_camera" if self.settings.camera_host else "not_started",
             "health_state": "degraded" if (health["routing"].get("degraded") or not health["camera"]["connected"]) else "online",
             "requested_inference_mode": self.settings.inference_mode.value,
             "effective_inference_mode": health["effective_inference_mode"],
@@ -140,10 +141,6 @@ class CommandExecutor:
         except CameraCommandError as exc:
             return CommandResult(command_id=command.command_id, state=CommandState.FAILED,
                                  failure_reason=exc.reason, message="Camera connection failed. Check camera settings.")
-        except NotImplementedError:
-            return CommandResult(command_id=command.command_id, state=CommandState.FAILED,
-                                 failure_reason=CommandFailureReason.UNSUPPORTED,
-                                 message="Requested inference mode is unavailable on this agent.")
         except Exception as exc:
             # Exception text can contain URLs or credentials from third-party
             # libraries. Only the type crosses the reporting/logging boundary.
@@ -154,6 +151,22 @@ class CommandExecutor:
             )
 
     async def _execute(self, command: ControlCommand) -> tuple[dict, str]:
+        if command.command_type is CommandType.REMOVE_CAMERA:
+            current = self.config_store.load()
+            camera_id = command.payload.get('camera_id')
+            if current is not None and current.camera is not None and current.camera.camera_id == camera_id:
+                self.config_store.save(current.model_copy(update={
+                    'camera': None, 'detection_settings': None, 'setup_state': SetupState.ENROLLED,
+                }))
+                # Do not retain deleted camera credentials in the automatic rollback file.
+                self.config_store.backup_path.unlink(missing_ok=True)
+                self.pipeline.router._accepting = False
+                self.pipeline.router._discard_pending()
+                if self.pipeline.router.clips is not None:
+                    self.pipeline.router.clips.clear_capture()
+                await asyncio.to_thread(self.pipeline.puller.stop)
+                self.restart_requested()
+            return {'camera_id': camera_id}, 'Camera capture removed.'
         if command.command_type is CommandType.DISCOVER:
             template = self._camera(command.payload)
             candidates = await discover_cameras(template, profile=StreamProfile.SUB)
@@ -192,9 +205,8 @@ class CommandExecutor:
                 return {}, "Camera configuration saved; restart requested."
             return {"success": True}, "Camera connection succeeded."
         if command.command_type is CommandType.SET_INFERENCE_MODE:
+            # Any of the four modes is accepted and stored; every one runs as CLOUD.
             mode = InferenceMode(command.payload["mode"])
-            if mode.value not in self.status()["capabilities"]["supported_inference_modes"]:
-                raise NotImplementedError
             await self.pipeline.change_mode(mode)
             current = self.config_store.load()
             if current is not None:

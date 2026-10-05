@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 
 import httpx
+import pytest
 from mantau_core.buffer import DurableSpool
 from mantau_core.contracts import Envelope, FallEvent, Heartbeat
 
@@ -26,7 +27,7 @@ def _client_and_spool(handler, tmp_path) -> tuple[UplinkClient, EnvelopeSpool]:
     return client, spool
 
 
-async def test_send_event_succeeds_without_spooling(tmp_path):
+async def test_send_succeeds_without_spooling(tmp_path):
     calls = []
 
     def handler(request):
@@ -34,30 +35,33 @@ async def test_send_event_succeeds_without_spooling(tmp_path):
         return httpx.Response(200, json={"status": "accepted", "duplicate": False, "out_of_order": False})
 
     client, spool = _client_and_spool(handler, tmp_path)
-    await client.send_event(FallEvent(camera_id="cam-1"))
+    await client.send_heartbeat(Heartbeat(
+        agent_id="agent-1", camera_id="cam-1", camera_reachable=True, detector_alive=False))
 
     assert len(calls) == 1
     assert spool.depth() == 0
     await client.close()
 
 
-async def test_send_event_spools_on_server_error(tmp_path):
+async def test_send_spools_on_server_error(tmp_path):
     def handler(request):
         return httpx.Response(500, json={"error": "boom"})
 
     client, spool = _client_and_spool(handler, tmp_path)
-    await client.send_event(FallEvent(camera_id="cam-1"))
+    await client.send_heartbeat(Heartbeat(
+        agent_id="agent-1", camera_id="cam-1", camera_reachable=True, detector_alive=False))
 
     assert spool.depth() == 1
     await client.close()
 
 
-async def test_send_event_spools_on_connection_failure(tmp_path):
+async def test_send_spools_on_connection_failure(tmp_path):
     def handler(request):
         raise httpx.ConnectError("refused", request=request)
 
     client, spool = _client_and_spool(handler, tmp_path)
-    await client.send_event(FallEvent(camera_id="cam-1"))
+    await client.send_heartbeat(Heartbeat(
+        agent_id="agent-1", camera_id="cam-1", camera_reachable=True, detector_alive=False))
 
     assert spool.depth() == 1
     await client.close()
@@ -72,7 +76,8 @@ async def test_a_successful_send_drains_previously_spooled_envelopes(tmp_path):
 
     failing_client = UplinkClient("http://server.local", "agent-1", "secret", seq, spool,
                                   client=httpx.AsyncClient(transport=httpx.MockTransport(failing)))
-    await failing_client.send_event(FallEvent(camera_id="cam-1"))
+    await failing_client.send_heartbeat(Heartbeat(
+        agent_id="agent-1", camera_id="cam-1", camera_reachable=True, detector_alive=False))
     assert spool.depth() == 1
     await failing_client.close()
 
@@ -85,9 +90,11 @@ async def test_a_successful_send_drains_previously_spooled_envelopes(tmp_path):
 
     recovered_client = UplinkClient("http://server.local", "agent-1", "secret", seq, spool,
                                     client=httpx.AsyncClient(transport=httpx.MockTransport(succeeding)))
-    await recovered_client.send_event(FallEvent(camera_id="cam-1"))  # triggers send + drain
+    # triggers send + drain
+    await recovered_client.send_heartbeat(Heartbeat(
+        agent_id="agent-1", camera_id="cam-1", camera_reachable=True, detector_alive=False))
 
-    assert spool.depth() == 0     # both the new event and the spooled one landed
+    assert spool.depth() == 0     # both the new envelope and the spooled one landed
     assert len(calls) == 2
     await recovered_client.close()
 
@@ -133,7 +140,8 @@ async def test_cancelled_send_is_spooled_before_cancellation_propagates(tmp_path
         await asyncio.Event().wait()
 
     client, spool = _client_and_spool(handler, tmp_path)
-    task = asyncio.create_task(client.send_event(FallEvent(camera_id="cam-1")))
+    task = asyncio.create_task(client.send_heartbeat(Heartbeat(
+        agent_id="agent-1", camera_id="cam-1", camera_reachable=True, detector_alive=False)))
     await started.wait()
     task.cancel()
     try:
@@ -163,4 +171,39 @@ async def test_expired_events_are_not_replayed(tmp_path):
         assert await client.drain_spool() == 0
     assert calls == []
     assert spool.depth() == 0
+    spool.close()
+
+
+async def test_full_spool_is_visible_and_preserves_pending_safety_event(tmp_path, caplog):
+    durable = DurableSpool(tmp_path / 'bounded.db', max_rows=1)
+    spool = EnvelopeSpool(durable)
+    pending = Envelope.for_event('agent', 999, FallEvent(camera_id='cam')).sign('secret')
+    spool.put(pending)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(503))) as http:
+        client = UplinkClient('http://server', 'agent', 'secret', SeqCounter(tmp_path / 'seq'), spool, client=http)
+        await client.send_heartbeat(Heartbeat(agent_id='agent', camera_reachable=True, detector_alive=False))
+        await client.send_heartbeat(Heartbeat(agent_id='agent', camera_reachable=True, detector_alive=False))
+        assert client.last_error == 'spool_capacity_exceeded'
+        assert client.spool_rejections == 2
+        assert spool.pending() == [pending]
+        assert 'not persisted' in caplog.text
+    spool.close()
+
+
+async def test_cancellation_remains_cancellation_when_spool_is_full(tmp_path):
+    spool = EnvelopeSpool(DurableSpool(tmp_path / 'bounded.db', max_rows=1))
+    spool.put(Envelope.for_event('agent', 999, FallEvent(camera_id='cam')).sign('secret'))
+    entered = asyncio.Event()
+    async def waiting(request):
+        entered.set()
+        await asyncio.Event().wait()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(waiting)) as http:
+        client = UplinkClient('http://server', 'agent', 'secret', SeqCounter(tmp_path / 'seq'), spool, client=http)
+        task = asyncio.create_task(client.send_heartbeat(Heartbeat(agent_id='agent', camera_reachable=True, detector_alive=False)))
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert client.spool_rejections == 1
+        assert spool.depth() == 1
     spool.close()
