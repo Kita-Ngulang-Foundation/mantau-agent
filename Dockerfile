@@ -11,5 +11,6 @@ RUN set -eu; \
 ENV MANTAU_SEQ_PATH=/data/seq.txt
 ENV MANTAU_SPOOL_PATH=/data/spool.db
 ENV MANTAU_CLIP_SPOOL_DIR=/data/clips
+ENV MANTAU_REQUIRE_HTTPS=true
 VOLUME ["/data"]
 CMD ["python", "-m", "mantau_agent.main"]

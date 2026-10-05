@@ -7,6 +7,7 @@
 !mantau-agent/
 !mantau-agent/pyproject.toml
 !mantau-agent/README.md
+!mantau-agent/mantau-core.ref
 !mantau-agent/src/
 !mantau-agent/src/**
 !mantau-agent/packaging/

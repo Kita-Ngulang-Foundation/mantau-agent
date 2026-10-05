@@ -9,6 +9,7 @@ import pytest
 from mantau_core.contracts import StreamProfile
 
 from mantau_agent.config import Settings
+import pytest
 from mantau_agent.main import _build_camera, _build_tunnel
 from mantau_agent.uplink.tunnel import NullTunnel, TailscaleTunnel
 
@@ -33,3 +34,11 @@ def test_build_tunnel_null_by_default():
 
 def test_build_tunnel_tailscale_when_configured():
     assert isinstance(_build_tunnel(Settings(tunnel_provider="tailscale")), TailscaleTunnel)
+
+
+def test_installed_agent_requires_https_and_does_not_embed_credentials():
+    for url in ('http://server.local', 'https://user:password@server.local', 'https:///missing-host'):
+        with pytest.raises(ValueError, match='HTTPS'):
+            Settings(require_https=True, server_url=url)
+    assert Settings(require_https=True, server_url='https://server.local').require_https
+    assert Settings(server_url='http://localhost:8100').server_url.startswith('http://')

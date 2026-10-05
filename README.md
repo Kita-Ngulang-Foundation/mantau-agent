@@ -328,7 +328,11 @@ enabled because the agent is headless.
 
 ## Development and verification
 
-Requires Python 3.10-3.12 and the sibling `../mantau-core` checkout.
+Requires Python 3.10-3.12. requirements.txt installs the immutable core ref;
+an adjacent source checkout is optional for development. Installed systemd and
+Docker runtimes require HTTPS; explicit MANTAU_REQUIRE_HTTPS=false is for local
+development only. Envelopes are bounded to 10,000 rows/16 MiB serialized data;
+capacity rejection is logged and counted without deleting pending entries.
 
 ```powershell
 py -3.12 -m venv .venv
