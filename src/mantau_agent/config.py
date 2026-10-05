@@ -65,7 +65,8 @@ class Settings(CoreSettings):
     # Use server inference when the server offers it (CLOUD/HYBRID and the
     # automatic fallback when the on-device detector cannot run).
     cloud_inference_enabled: bool = True
-    hybrid_confirmation_fps: float = Field(default=0.2, gt=0, allow_inf_nan=False)
+    # How often an agent without server inference asks the server again.
+    inference_probe_interval_s: float = Field(default=60.0, gt=0, allow_inf_nan=False)
     frame_queue_size: int = Field(default=2, ge=1)
     upload_timeout_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     sampler_keep_every_n: int = Field(default=1, ge=1)

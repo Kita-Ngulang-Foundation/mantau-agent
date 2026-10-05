@@ -1,17 +1,18 @@
 """Build an envelope, try to send it, spool it on failure, drain the spool
 whenever a send succeeds. Never raises past this module's boundary --
-`detect/runner.py`'s `on_event` and the heartbeat loop fire-and-forget into
-`send_event`/`send_heartbeat`; a fall event that can't reach the server yet
-must never crash the detection loop that found it.
+the heartbeat loop fires and forgets into `send_heartbeat`, and an envelope
+that can't reach the server yet must never crash the loop that sent it.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 
 import httpx
-from mantau_core.contracts import Envelope, FallEvent, Heartbeat
+from mantau_core.contracts import Envelope, Heartbeat
+from mantau_core.buffer.spool import SpoolCapacityError
 
 from .seq import SeqCounter
 from .spool import EnvelopeSpool
@@ -40,10 +41,18 @@ class UplinkClient:
         self.server_reachable = False
         self.last_successful_contact: datetime | None = None
         self.last_error: str | None = None
+        self.spool_rejections = 0
 
-    async def send_event(self, event: FallEvent) -> None:
-        envelope = Envelope.for_event(self.agent_id, self._seq.next(), event).sign(self._secret)
-        await self._send_or_spool(envelope)
+    def _persist_failed(self, envelope: Envelope) -> None:
+        try:
+            self._spool.put(envelope)
+        except (SpoolCapacityError, OSError) as exc:
+            self.spool_rejections += 1
+            self.last_error = 'spool_capacity_exceeded' if isinstance(exc, SpoolCapacityError) else 'spool_storage_failed'
+            logging.getLogger(__name__).error('Envelope was not persisted: %s; total rejected=%s',
+                                              self.last_error, self.spool_rejections)
+        finally:
+            self._retry_signal.set()
 
     async def send_heartbeat(self, heartbeat: Heartbeat) -> None:
         envelope = Envelope.for_heartbeat(self.agent_id, self._seq.next(), heartbeat).sign(self._secret)
@@ -54,12 +63,10 @@ class UplinkClient:
         try:
             await self._post(envelope)
         except asyncio.CancelledError:
-            self._spool.put(envelope)
-            self._retry_signal.set()
+            self._persist_failed(envelope)
             raise
         except httpx.HTTPError:
-            self._spool.put(envelope)
-            self._retry_signal.set()
+            self._persist_failed(envelope)
             return
         # A send just succeeded -- also a good moment to clear anything that
         # piled up during a prior outage, without waiting for a new event.

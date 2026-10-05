@@ -81,15 +81,19 @@ async def test_pipeline_starts_captures_reports_truthful_health_and_shuts_down(p
             break
         await asyncio.sleep(.005)
     assert pipeline.puller.started == 1
-    assert pipeline.router.synthetic_events_suppressed == 0
     assert pipeline.router.mode == Mode.CLOUD
-    assert pipeline.router.detector is None
+    assert not pipeline.router.detector_alive
     assert all(request.url.path == "/ingest" for request in calls)
     heartbeats = [json.loads(request.content) for request in calls]
     assert heartbeats and all(h["kind"] == "heartbeat" for h in heartbeats)
     assert all(not h["payload"]["detector_alive"] for h in heartbeats)
-    assert pipeline.health()["capabilities"]["detector_backend"] == "null"
+    assert pipeline.health()["effective_inference_mode"] == "CLOUD"
     await pipeline.change_mode(Mode.CLOUD)
+    for _ in range(100):
+        await pipeline.router.wait_idle()
+        if not pipeline.health()["routing"]["degraded"]:
+            break
+        await asyncio.sleep(.005)
     assert not pipeline.health()["routing"]["degraded"]
     await asyncio.wait_for(pipeline.shutdown(), .5)
     await pipeline.shutdown()
@@ -131,8 +135,8 @@ async def test_configured_mediapipe_is_not_loaded(
     monkeypatch.setitem(sys.modules, "mantau.api.streaming", None)
     pipeline, _ = await pipeline_factory(detector_backend="mediapipe", inference_mode=Mode.AUTO)
     assert pipeline.router.mode == Mode.CLOUD
-    assert pipeline.router.detector is None
-    assert pipeline.router.capabilities.detector_backend == "null"
+    assert not pipeline.router.detector_alive
+    assert "mantau.api.streaming" in sys.modules and sys.modules["mantau.api.streaming"] is None
 
 
 async def test_explicit_cloud_does_not_construct_local_detector(pipeline_factory, monkeypatch):
@@ -146,10 +150,8 @@ async def test_explicit_cloud_does_not_construct_local_detector(pipeline_factory
         async def close(self):
             pass
 
-    monkeypatch.setattr(main, "_build_detector", forbidden)
-    pipeline, _ = await pipeline_factory(inference_mode=Mode.CLOUD, detector_backend="mediapipe",
-                                         inference_uplink=Cloud())
-    assert pipeline.router.detector is None
+    pipeline, _ = await pipeline_factory(inference_mode=Mode.CLOUD, inference_uplink=Cloud())
+    assert not pipeline.router.detector_alive
     assert pipeline.router.mode == Mode.CLOUD
 
 

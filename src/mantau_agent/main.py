@@ -1,4 +1,4 @@
-"""Build the monitoring pipeline from existing camera, detector and uplinks."""
+"""Build the monitoring pipeline from existing camera and uplinks."""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ from contextlib import AsyncExitStack
 from mantau_core.buffer import DurableSpool
 from mantau_core.contracts import CameraRef, Credentials, StreamProfile
 from mantau_core.activity import ActivityEngine
-from mantau_core.detection import Detector, NullDetector
 from mantau_core.resilience import BackoffPolicy
 
 from .activity_rules import build_activity_rules
@@ -52,17 +51,6 @@ def _build_camera(settings: Settings) -> CameraRef:
                       paths=paths, credentials=credentials)
 
 
-def _build_detector(settings: Settings) -> Detector:
-    if settings.detector_backend == "mediapipe":
-        from mantau_core.detection.mediapipe_adapter import MediapipeDetector
-        config = {"fall": {"classifier": {"enabled": settings.fall_classifier_enabled}}}
-        return MediapipeDetector(settings.camera_id, config=config,
-                                 model_dir=settings.model_dir or None)
-    if settings.detector_backend != "null":
-        raise ValueError(f"Unknown detector backend: {settings.detector_backend}")
-    return NullDetector(settings.camera_id)
-
-
 def _build_tunnel(settings: Settings) -> TunnelProvider:
     if settings.tunnel_provider == "tailscale":
         return TailscaleTunnel()
@@ -92,37 +80,6 @@ async def _discover_camera(settings: Settings) -> CameraRef:
     return camera
 
 
-def _probe_capabilities(settings: Settings, *, cloud_available: bool = False):
-    probe = None
-    error = None
-    # With server inference available, a detector that will not load is a
-    # fallback to CLOUD, not a fatal error, whatever mode was requested.
-    tolerate = settings.inference_mode == InferenceMode.AUTO or cloud_available
-    try:
-        # CLOUD needs no local model unless there is no cloud to fall back on.
-        if settings.inference_mode != InferenceMode.CLOUD or not cloud_available:
-            try:
-                probe = _build_detector(settings)
-            except ImportError:
-                if not tolerate:
-                    raise  # Preserve MediaPipe's actionable construction error.
-                error = "Configured detector unavailable; install mantau-core[detection] streaming adapter"
-            except (RuntimeError, OSError, ValueError) as exc:
-                # Missing/tampered model files or a runtime that will not load.
-                # Only the type and our own message cross this boundary.
-                if not tolerate:
-                    raise
-                error = f"Configured detector failed to load ({type(exc).__name__})"
-        return inspect_capabilities(
-            detector_backend=settings.detector_backend, detector=probe,
-            detector_error=error, detection_fps=settings.detection_fps,
-            cloud_available=cloud_available,
-        )
-    finally:
-        if probe is not None:
-            probe.close()
-
-
 async def build_pipeline(settings: Settings, *,
                          inference_uplink: InferenceUplink | None = None,
                          configuration_store=None) -> MonitoringPipeline:
@@ -144,6 +101,7 @@ async def build_pipeline(settings: Settings, *,
     camera = await _discover_camera(settings)
     cloud_upload_fps = settings.cloud_upload_fps
     owned_uplink = None
+    inference_probe = None
     if inference_uplink is None:
         capability = await discover_capability(settings.server_url)
         if capability is not None and capability.available:
@@ -151,14 +109,16 @@ async def build_pipeline(settings: Settings, *,
                 settings.server_url, settings.agent_id, settings.agent_secret, capability)
             cloud_upload_fps = cloud_rate(settings.cloud_upload_fps, capability)
         else:
-            raise RuntimeError("Server inference unavailable: " +
-                               (capability.reason if capability is not None else "no capability response"))
+            logging.getLogger(__name__).warning("Server inference unavailable; capturing without protection until recovery")
+
+            async def inference_probe() -> bool:
+                offered = await discover_capability(settings.server_url)
+                return offered is not None and offered.available
     capabilities = await asyncio.to_thread(
-        inspect_capabilities, cloud_available=True)
+        inspect_capabilities, cloud_available=inference_uplink is not None)
     async with AsyncExitStack() as cleanup:
         if owned_uplink is not None:
             cleanup.push_async_callback(owned_uplink.close)
-        detector = None
         spool = EnvelopeSpool(DurableSpool(settings.spool_path, ttl_s=settings.spool_ttl_s))
         cleanup.callback(spool.close)
         uplink = UplinkClient(settings.server_url, settings.agent_id, settings.agent_secret,
@@ -185,17 +145,15 @@ async def build_pipeline(settings: Settings, *,
                 fps=settings.clip_fps, pre_s=settings.clip_pre_s, post_s=settings.clip_post_s,
             )
             if owned_uplink is not None:
-                # Falls the server detects get the same review clip as local ones.
+                # Events the server detects get a review clip.
                 owned_uplink.on_events = lambda events: [clips.on_event(e) for e in events]
         router = InferenceRouter(
-            camera_id=settings.camera_id, detector=detector, event_uplink=uplink,
-            activity=activity, clips=clips,
+            camera_id=settings.camera_id, activity=activity, clips=clips,
             frame_uplink=frames, capabilities=capabilities, mode=settings.inference_mode,
             inference_uplink=inference_uplink,
             sampler=FrameSampler(keep_every_n=settings.sampler_keep_every_n,
                                  max_fps=settings.sampler_max_fps),
-            detection_fps=settings.detection_fps, cloud_upload_fps=cloud_upload_fps,
-            confirmation_fps=settings.hybrid_confirmation_fps,
+            cloud_upload_fps=cloud_upload_fps,
             live_view_fps=settings.live_view_fps, live_view_enabled=settings.live_view_enabled,
             queue_size=settings.frame_queue_size, upload_timeout_s=settings.upload_timeout_s,
         )
@@ -211,6 +169,8 @@ async def build_pipeline(settings: Settings, *,
                                         cap=settings.spool_retry_cap_s),
             status_store=StatusStore(settings.status_path),
             status_interval_s=settings.status_interval_s,
+            inference_probe=inference_probe,
+            inference_probe_interval_s=settings.inference_probe_interval_s,
         )
         if settings.command_channel_enabled:
             executor = CommandExecutor(

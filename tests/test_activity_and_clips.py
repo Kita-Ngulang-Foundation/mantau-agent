@@ -1,10 +1,9 @@
 import asyncio
-from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import httpx
 import pytest
-from mantau_core.activity import ActivityEngine, FrameObservation, Perception
+from mantau_core.activity import ActivityEngine
 from mantau_core.contracts import (
     CommandState, CommandType, ControlCommand, DetectionSettings, EventKind, FallEvent,
 )
@@ -17,7 +16,7 @@ from mantau_agent.state import (
     AgentConfiguration, ConfigurationStore, EnrollmentConfiguration, SetupState,
 )
 
-from test_inference_router import FRAME, Mode, feed, rig  # noqa: F401 -- fixture reuse
+from test_inference_router import FRAME
 
 
 class FakeUploader:
@@ -115,45 +114,6 @@ async def test_uploader_signs_the_clip_for_its_event():
     import hmac
     assert seen[0].headers["X-Mantau-Signature"] == hmac.new(
         b"secret", b"evt-1.mp4", hashlib.sha256).hexdigest()
-
-
-class Perceiver:
-    def __init__(self):
-        self.closed = 0
-
-    def push(self, image, ts):
-        raise AssertionError("perceive() must be used")
-
-    def perceive(self, image, ts):
-        return Perception(
-            events=[FallEvent(camera_id="cam", event_id=f"fall-{ts}")] if ts == 0 else [],
-            observation=FrameObservation(camera_id="cam", at=datetime.now(timezone.utc)),
-        )
-
-    def close(self):
-        self.closed += 1
-
-
-class StillRule:
-    kind = EventKind.STILLNESS
-
-    def update(self, observation, settings):
-        return [FallEvent(camera_id="cam", kind=self.kind, event_id="still-1")]
-
-    def reset(self):
-        pass
-
-
-async def test_perceiving_detector_feeds_activity_rules_and_clips(rig, tmp_path):  # noqa: F811
-    uploader = FakeUploader()
-    recorder = _recorder(tmp_path, uploader)
-    router, _, events, _, _, now = rig(
-        detector=Perceiver(), activity=ActivityEngine([StillRule()]), clips=recorder)
-    await router.start()
-    await feed(router, now, [0])
-    assert [e.event_id for e in events.events] == ["fall-0", "still-1"]
-    assert {c.event_id for c in recorder._captures} == {"fall-0", "still-1"}
-    assert router.health()["activity_rules"] == ["StillRule"]
 
 
 def _command(payload):

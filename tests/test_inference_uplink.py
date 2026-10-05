@@ -1,4 +1,4 @@
-"""HttpInferenceUplink (server inference) and the automatic EDGE -> CLOUD fallback.
+"""HttpInferenceUplink (server inference) and the CLOUD-only pipeline wiring.
 
 Wire-level tests use httpx.MockTransport and check the real signature with
 mantau-core's verifier. The round-trip tests at the end run the actual
@@ -23,7 +23,7 @@ from mantau_agent.config import Settings
 from mantau_agent.uplink.inference import HttpInferenceUplink, cloud_rate, discover_capability
 
 SECRET = "agent-secret"
-CAPABILITY = InferenceCapability(available=True, detector="mediapipe", max_frame_bytes=1024,
+CAPABILITY = InferenceCapability(available=True, detector="pose", max_frame_bytes=1024,
                                  max_frame_age_s=10.0, max_fps=15.0)
 
 
@@ -198,22 +198,16 @@ async def build(monkeypatch, tmp_path):
     monkeypatch.setattr("mantau_agent.capabilities._memory_bytes", lambda: 2 * 1024**3)
     pipelines = []
 
-    async def create(*, capability=CAPABILITY, detector=None, detector_error=None, **overrides):
+    async def create(*, capability=CAPABILITY, **overrides):
         async def discover(*args, **kwargs):
             return capability
 
-        def build_detector(settings):
-            if detector_error is not None:
-                raise detector_error
-            return detector
-
         monkeypatch.setattr(main, "discover_capability", discover)
-        monkeypatch.setattr(main, "_build_detector", build_detector)
         settings = Settings(agent_id="agent-1", agent_secret=SECRET, camera_host="localhost",
                             server_url="http://127.0.0.1:9", seq_path=str(tmp_path / "seq"),
                             spool_path=str(tmp_path / "spool.db"),
                             status_path=str(tmp_path / "status.json"),
-                            detector_backend="mediapipe", clips_enabled=False, **overrides)
+                            clips_enabled=False, **overrides)
         pipeline = await main.build_pipeline(settings)
         pipelines.append(pipeline)
         return pipeline
@@ -223,56 +217,25 @@ async def build(monkeypatch, tmp_path):
         await pipeline.shutdown()
 
 
-class _Detector:
-    def __init__(self, fps: float):
-        self.fps = fps
-
-    def benchmark(self):
-        return self.fps
-
-    def push(self, frame, ts):
-        return []
-
-    def close(self):
-        pass
-
-
-@pytest.mark.parametrize("requested", list(Mode))
-async def test_configured_local_mode_never_loads_local_model(build, requested):
-    pipeline = await build(detector_error=AssertionError("local model was loaded"),
-                           inference_mode=requested)
-    router = pipeline.router
-    assert router.mode == Mode.CLOUD
-    assert isinstance(router.inference_uplink, HttpInferenceUplink)
-    assert router.detector is None
-    assert router.capabilities.detector_backend == "null"
-    assert router.capabilities.supported_inference_modes == [Mode.AUTO, Mode.CLOUD]
-
-
-async def test_local_throughput_is_ignored(build):
-    pipeline = await build(detector=_Detector(fps=2.0), inference_mode=Mode.AUTO,
-                           detection_fps=15.0)
+@pytest.mark.parametrize('requested', list(Mode))
+async def test_legacy_local_modes_are_cloud_only(build, requested):
+    pipeline = await build(inference_mode=requested)
     assert pipeline.router.mode == Mode.CLOUD
-    assert pipeline.router.detector is None
-    assert pipeline.router.cloud_upload_fps == 10.0
+    assert not pipeline.router.detector_alive
+    assert isinstance(pipeline.router.inference_uplink, HttpInferenceUplink)
 
-
-async def test_fast_edge_model_is_not_selected(build):
-    pipeline = await build(detector=_Detector(fps=40.0), inference_mode=Mode.AUTO)
-    assert pipeline.router.mode == Mode.CLOUD
-    assert Mode.HYBRID not in pipeline.router.capabilities.supported_inference_modes
-
-
-@pytest.mark.parametrize("requested", list(Mode))
-async def test_without_server_inference_startup_fails_closed(build, requested):
-    unavailable = CAPABILITY.model_copy(update={"available": False, "reason": "disabled"})
-    with pytest.raises(RuntimeError, match="Server inference unavailable"):
-        await build(capability=unavailable, inference_mode=requested)
+@pytest.mark.parametrize('requested', list(Mode))
+async def test_cloud_outage_starts_degraded_and_keeps_recovery(build, requested):
+    unavailable = CAPABILITY.model_copy(update={'available': False, 'reason': 'disabled'})
+    pipeline = await build(capability=unavailable, inference_mode=requested)
+    assert pipeline.router.health()['degraded']
+    assert pipeline.router.inference_uplink is None
+    assert pipeline._inference_probe is not None
 
 
 async def test_server_rate_caps_the_cloud_upload_rate(build):
     slow_server = CAPABILITY.model_copy(update={"max_fps": 4.0})
-    pipeline = await build(capability=slow_server, detector_error=RuntimeError("x"))
+    pipeline = await build(capability=slow_server)
     assert pipeline.router.cloud_upload_fps == 4.0
 
 
@@ -350,33 +313,6 @@ async def test_cloud_round_trip_produces_a_stored_fall_event(server):
     assert len(delivered) == 1
     stored = (await client.get(f"/events/{delivered[0].event_id}", headers=user)).json()
     assert stored["camera_id"] == "cam-1" and stored["signals"]["server_inference"] == 1.0
-
-
-async def test_hybrid_confirmation_round_trip(server):
-    from mantau_core.buffer import DurableSpool
-    from mantau_agent.uplink.client import UplinkClient
-    from mantau_agent.uplink.seq import SeqCounter
-    from mantau_agent.uplink.spool import EnvelopeSpool
-
-    client, secret, user = server
-    capability = await discover_capability("http://server", client=client)
-    # The agent's own detector found a fall and sent it the normal way...
-    import tempfile
-    with tempfile.TemporaryDirectory() as tmp:
-        spool = EnvelopeSpool(DurableSpool(f"{tmp}/spool.db", ttl_s=300))
-        events = UplinkClient("http://server", "agent-1", secret, SeqCounter(f"{tmp}/seq"),
-                              spool, client=client)
-        local = FallEvent(camera_id="cam-1", confidence=0.7)
-        await events.send_event(local)
-        spool.close()
-    # ...then HYBRID asks the server to confirm it from one frame.
-    uplink = HttpInferenceUplink("http://server", "agent-1", secret, capability, client=client)
-    assert await uplink.submit(_jpeg(True), camera_id="cam-1", ts_ms=5000,
-                               event_ids=(local.event_id,))
-    confirmation = uplink.last_result.confirmations[0]
-    assert confirmation.event_id == local.event_id and confirmation.confirmed
-    stored = (await client.get(f"/events/{local.event_id}", headers=user)).json()
-    assert stored["server_confirmed"] is True
 
 
 async def test_tampered_upload_is_rejected_by_the_real_server(server):
