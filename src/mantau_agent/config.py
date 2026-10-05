@@ -10,13 +10,24 @@ does anywhere else `mantau_core.buffer.DurableSpool` is used.
 from __future__ import annotations
 
 from mantau_core.config import CoreSettings
-from pydantic import Field
+from pydantic import Field, model_validator
+from urllib.parse import urlsplit
 from pydantic_settings import PydanticBaseSettingsSource
 
 from .capabilities import InferenceMode
 
 
 class Settings(CoreSettings):
+    require_https: bool = False
+
+    @model_validator(mode='after')
+    def production_transport(self):
+        if self.require_https:
+            url = urlsplit(self.server_url)
+            if url.scheme != 'https' or not url.hostname or url.username is not None or url.password is not None:
+                raise ValueError('Production agent requires an HTTPS server URL without embedded credentials')
+        return self
+
     @classmethod
     def settings_customise_sources(
         cls, settings_cls, init_settings: PydanticBaseSettingsSource,

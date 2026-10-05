@@ -18,7 +18,10 @@ Outputs:
 - `dist/mantau-agent-linux-arm64`
 
 The build context is the parent `mantau-prototype` directory because the agent
-depends on the sibling `mantau-core` package. PyInstaller must build on the same
+build recipe lives under the agent subdirectory. Its core package is fetched
+from the exact mantau-core.ref, without trusting a sibling checkout. The OS
+FFmpeg executable is installed separately on the target by install.sh and must
+include libx264. PyInstaller must build on the same
 OS family and architecture it targets; buildx supplies the architecture-specific
 Linux environment. Building is not proof that camera codecs or detector
 accelerators work on a target, so run the resulting artifact on representative

@@ -20,6 +20,7 @@ Environment=MANTAU_CLIP_SPOOL_DIR=/var/lib/mantau-agent/clips
 Environment=MANTAU_STATUS_PATH=/var/lib/mantau-agent/status.json
 Environment=MANTAU_COMMAND_STATE_PATH=/var/lib/mantau-agent/commands.json
 Environment=PYTHONUNBUFFERED=1
+Environment=MANTAU_REQUIRE_HTTPS=true
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
