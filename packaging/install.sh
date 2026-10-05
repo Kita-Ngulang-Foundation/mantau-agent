@@ -59,7 +59,7 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
     fi
 fi
 if ! ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libx264; then
-    echo "FFmpeg must include the libx264 encoder for Android-compatible clips." >&2
+    echo "FFmpeg must include the libx264 encoder for caregiver review clips." >&2
     exit 1
 fi
 
