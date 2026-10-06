@@ -4,5 +4,7 @@
 !mantau-core.ref
 !src/
 !src/**
+!scripts/
+!scripts/**
 **/__pycache__
 **/*.pyc

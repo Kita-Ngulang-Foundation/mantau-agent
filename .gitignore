@@ -27,3 +27,7 @@ Thumbs.db
 # CI checkout of mantau-core
 .deps/
 
+# Local assistant tooling and notes
+.claude/
+CLAUDE.md
+claude_plan.md
