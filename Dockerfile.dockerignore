@@ -12,6 +12,8 @@
 !mantau-agent/src/**
 !mantau-agent/tests/
 !mantau-agent/tests/**
+!mantau-agent/scripts/
+!mantau-agent/scripts/**
 !protocol/
 !protocol/examples/
 !protocol/examples/**
