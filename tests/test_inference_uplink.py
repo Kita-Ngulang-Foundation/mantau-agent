@@ -18,6 +18,7 @@ from mantau_core.contracts import FallEvent, InferenceCapability, InferenceResul
 from mantau_core.contracts import inference as contract
 
 from mantau_agent import main
+from mantau_agent.capabilities import InferenceMode as Mode
 from mantau_agent.config import Settings
 from mantau_agent.uplink.inference import HttpInferenceUplink, cloud_rate, discover_capability
 
@@ -216,6 +217,22 @@ async def build(monkeypatch, tmp_path):
         await pipeline.shutdown()
 
 
+@pytest.mark.parametrize('requested', list(Mode))
+async def test_legacy_local_modes_are_cloud_only(build, requested):
+    pipeline = await build(inference_mode=requested)
+    assert pipeline.router.mode == Mode.CLOUD
+    assert not pipeline.router.detector_alive
+    assert isinstance(pipeline.router.inference_uplink, HttpInferenceUplink)
+
+@pytest.mark.parametrize('requested', list(Mode))
+async def test_cloud_outage_starts_degraded_and_keeps_recovery(build, requested):
+    unavailable = CAPABILITY.model_copy(update={'available': False, 'reason': 'disabled'})
+    pipeline = await build(capability=unavailable, inference_mode=requested)
+    assert pipeline.router.health()['degraded']
+    assert pipeline.router.inference_uplink is None
+    assert pipeline._inference_probe is not None
+
+
 async def test_server_rate_caps_the_cloud_upload_rate(build):
     slow_server = CAPABILITY.model_copy(update={"max_fps": 4.0})
     pipeline = await build(capability=slow_server)
@@ -250,16 +267,25 @@ async def server():
     pytest.importorskip("mantau_ld.api.app")
     from mantau_ld.api.app import create_app
     from mantau_ld.config import Settings as ServerSettings
+    from mantau_ld.oidc_auth import OidcIdentity, OidcTokenError
 
-    app = create_app(ServerSettings(db_path=":memory:", control_plane_mode="local_dev",
+    class _OneUser:
+        """Stands in for Firebase token validation: one fixed signed-in user."""
+
+        def authenticate(self, authorization):
+            if authorization != "Bearer family-token":
+                raise OidcTokenError("invalid bearer token")
+            return OidcIdentity(issuer="https://securetoken.google.com/test", subject="family")
+
+    app = create_app(ServerSettings(db_path=":memory:", firebase_project_id="test",
                                     inference_max_fps=1000),
-                     inference_factory=_ServerDetector)
-    user = {"X-Mantau-User-ID": "family"}
+                     inference_factory=_ServerDetector, oidc_authenticator=_OneUser())
+    user = {"Authorization": "Bearer family-token"}
     async with app.router.lifespan_context(app), httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://server") as client:
-        enrolled = (await client.post("/agents/enroll", json={"agent_id": "agent-1"})).json()
-        assert (await client.post("/agent-claims", headers=user, json={
-            "claim_code": enrolled["claim_code"], "platform": "linux_x86_64"})).status_code == 200
+        key = (await client.post("/enrollment-keys", headers=user)).json()["enrollment_key"]
+        enrolled = (await client.post("/agents/enroll", json={
+            "enrollment_key": key, "agent_id": "agent-1", "platform": "linux_x86_64"})).json()
         assert (await client.post("/cameras", headers=user, json={
             "camera_id": "cam-1", "name": "Kamar", "agent_id": "agent-1"})).status_code == 201
         yield client, enrolled["secret"], user

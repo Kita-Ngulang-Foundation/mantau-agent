@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 
 import httpx
+import pytest
 from mantau_core.buffer import DurableSpool
 from mantau_core.contracts import Envelope, FallEvent, Heartbeat
 
@@ -170,4 +171,39 @@ async def test_expired_events_are_not_replayed(tmp_path):
         assert await client.drain_spool() == 0
     assert calls == []
     assert spool.depth() == 0
+    spool.close()
+
+
+async def test_full_spool_is_visible_and_preserves_pending_safety_event(tmp_path, caplog):
+    durable = DurableSpool(tmp_path / 'bounded.db', max_rows=1)
+    spool = EnvelopeSpool(durable)
+    pending = Envelope.for_event('agent', 999, FallEvent(camera_id='cam')).sign('secret')
+    spool.put(pending)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(503))) as http:
+        client = UplinkClient('http://server', 'agent', 'secret', SeqCounter(tmp_path / 'seq'), spool, client=http)
+        await client.send_heartbeat(Heartbeat(agent_id='agent', camera_reachable=True, detector_alive=False))
+        await client.send_heartbeat(Heartbeat(agent_id='agent', camera_reachable=True, detector_alive=False))
+        assert client.last_error == 'spool_capacity_exceeded'
+        assert client.spool_rejections == 2
+        assert spool.pending() == [pending]
+        assert 'not persisted' in caplog.text
+    spool.close()
+
+
+async def test_cancellation_remains_cancellation_when_spool_is_full(tmp_path):
+    spool = EnvelopeSpool(DurableSpool(tmp_path / 'bounded.db', max_rows=1))
+    spool.put(Envelope.for_event('agent', 999, FallEvent(camera_id='cam')).sign('secret'))
+    entered = asyncio.Event()
+    async def waiting(request):
+        entered.set()
+        await asyncio.Event().wait()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(waiting)) as http:
+        client = UplinkClient('http://server', 'agent', 'secret', SeqCounter(tmp_path / 'seq'), spool, client=http)
+        task = asyncio.create_task(client.send_heartbeat(Heartbeat(agent_id='agent', camera_reachable=True, detector_alive=False)))
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert client.spool_rejections == 1
+        assert spool.depth() == 1
     spool.close()

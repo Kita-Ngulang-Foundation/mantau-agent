@@ -88,6 +88,8 @@ class CameraPuller:
                         self.last_frame_at = datetime.now(timezone.utc)
             except Exception as exc:  # noqa: BLE001 -- this IS the reconnect boundary
                 self.reachable = False
+                with self._lock:
+                    self._latest = None
                 # Native capture exceptions can echo the RTSP URL, including
                 # embedded credentials. Keep health useful without persisting
                 # or logging third-party exception text.
@@ -113,6 +115,8 @@ class CameraPuller:
 
     def latest_frame(self) -> tuple[np.ndarray, int] | None:
         with self._lock:
+            if self.last_frame_at is None or (datetime.now(timezone.utc)-self.last_frame_at).total_seconds()>15:
+                return None
             return self._latest
 
     def stop(self) -> None:

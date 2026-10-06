@@ -10,13 +10,24 @@ does anywhere else `mantau_core.buffer.DurableSpool` is used.
 from __future__ import annotations
 
 from mantau_core.config import CoreSettings
-from pydantic import Field
+from pydantic import Field, model_validator
+from urllib.parse import urlsplit
 from pydantic_settings import PydanticBaseSettingsSource
 
 from .capabilities import InferenceMode
 
 
 class Settings(CoreSettings):
+    require_https: bool = False
+
+    @model_validator(mode='after')
+    def production_transport(self):
+        if self.require_https:
+            url = urlsplit(self.server_url)
+            if url.scheme != 'https' or not url.hostname or url.username is not None or url.password is not None:
+                raise ValueError('Production agent requires an HTTPS server URL without embedded credentials')
+        return self
+
     @classmethod
     def settings_customise_sources(
         cls, settings_cls, init_settings: PydanticBaseSettingsSource,
@@ -30,8 +41,12 @@ class Settings(CoreSettings):
 
     # -- server connection ---------------------------------------------------
     server_url: str = "http://localhost:8100"
-    agent_id: str = ""      # set via MANTAU_AGENT_ID, from POST /agents/enroll
-    agent_secret: str = ""  # set via MANTAU_AGENT_SECRET, from the same call
+    agent_id: str = ""      # saved by enrollment (POST /agents/enroll)
+    agent_secret: str = ""  # saved by the same call; never typed by anyone
+    # Single-use key from the Mantau app. With no saved enrollment, `run`
+    # enrolls with it once (unattended Docker installs).
+    enrollment_key: str = Field(default="", repr=False)
+    device_name: str = ""
 
     # -- camera: manual config path (ONVIF discovery picks its own CameraRef) -
     camera_id: str = "cam-1"
@@ -45,18 +60,21 @@ class Settings(CoreSettings):
     default_stream_profile: str = "sub"  # "sub" | "main"
 
     # -- detection -------------------------------------------------------------
-    # Inference is CLOUD only: the agent uploads sampled frames and the server
-    # runs the fall detector. All four modes are still accepted (the stored
-    # default is AUTO) and every one runs as CLOUD. Settings of the removed
-    # on-device detector (MANTAU_DETECTOR_BACKEND, MANTAU_MODEL_DIR,
-    # MANTAU_DETECTION_FPS, ...) are ignored, not rejected.
-    inference_mode: InferenceMode = InferenceMode.AUTO
-    # Frames per second uploaded for server inference. The default is the
-    # server's own cap (`inference_max_fps`, 15); a lower max_fps advertised
-    # by the server lowers it further.
-    cloud_upload_fps: float = Field(default=15.0, gt=0, le=15.0, allow_inf_nan=False)
-    # Use server inference when the server offers it. Without it the agent
-    # detects nothing and reports degraded health.
+    detector_backend: str = "null"       # Retained for existing configs; runtime uses server inference.
+    # Directory holding the pinned model files (see mantau_core.detection.
+    # artifacts); empty = the models packaged with the installed mantau-AI.
+    model_dir: str = ""
+    fall_classifier_enabled: bool = True
+    inference_mode: InferenceMode = InferenceMode.CLOUD
+    # 15 fps matched full-frame-rate accuracy on the UR Fall and Y-B-Class clips;
+    # at 5-10 fps the tracker loses the person mid-fall and recall drops.
+    detection_fps: float = Field(default=15.0, gt=0, allow_inf_nan=False)
+    # CLOUD sends frames for the server to run the fall detector on. Below
+    # ~10 fps the fall tracker loses people mid-fall (mantau-AI
+    # docs/EVALUATION.md); the server's advertised max_fps caps this.
+    cloud_upload_fps: float = Field(default=10.0, gt=0, le=15.0, allow_inf_nan=False)
+    # Use server inference when the server offers it (CLOUD/HYBRID and the
+    # automatic fallback when the on-device detector cannot run).
     cloud_inference_enabled: bool = True
     # How often an agent without server inference asks the server again.
     inference_probe_interval_s: float = Field(default=60.0, gt=0, allow_inf_nan=False)
@@ -74,7 +92,10 @@ class Settings(CoreSettings):
     clip_post_s: float = Field(default=5.0, ge=1, le=30)
     clip_spool_dir: str = "data/clips"
     live_view_enabled: bool = True
-    live_view_fps: float = Field(default=4.0, gt=0, allow_inf_nan=False)
+    # Video rate while someone watches (the server says so on each upload);
+    # the idle rate keeps the snapshot fresh for the zone editor.
+    live_view_fps: float = Field(default=10.0, gt=0, le=15, allow_inf_nan=False)
+    live_view_idle_fps: float = Field(default=1.0, gt=0, le=2, allow_inf_nan=False)
     live_view_jpeg_quality: int = 70
     live_view_max_width: int = 640
 

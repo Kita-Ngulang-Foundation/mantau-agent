@@ -4,58 +4,56 @@ Mantau has two separate installable agent runtimes with one control-plane
 contract:
 
 - the Python agent for unattended Linux and 64-bit Raspberry Pi devices;
-- the native Kotlin Android Agent under `android-agent/` for a spare phone that
+- the native Kotlin Android Agent in the separate `mantau-android-agent` repository for a spare phone that
   remains at home on the CCTV LAN.
 
-Both use the shared claim, agent ID, capability, health, camera, command, and
+Both use the shared enrollment, agent ID, capability, health, camera, command, and
 inference-mode wire models from `mantau-core`. Android reports platform
 `android`. The Android Agent is not `mantau-app`; RTSP, ONVIF, and monitoring
 remain outside the Flutter control app.
 
 The Linux/Pi agent discovers or accepts a manual RTSP camera, captures the
-preferred low-bitrate stream, uploads sampled frames for the server to run fall
-detection on, durably uploads health, and runs under systemd.
+preferred low-bitrate stream, uploads sampled frames for server inference,
+durably uploads health, and runs under systemd.
 Raspberry Pi uses the same Linux ARM64 build and code path.
 
 ```text
 ONVIF/manual setup -> RTSP validation -> durable config
     -> CameraPuller (bounded reconnect backoff + jitter, latest frame)
     -> bounded independent sampling queues
-       CLOUD  -> sampled frame -> server inference (the server detects falls)
+       CLOUD  -> sampled frame -> server-inference interface
        live   -> existing signed live-view frame endpoint
     -> SQLite event/heartbeat spool -> prompt retry after connectivity returns
     -> heartbeat + atomic local status snapshot
 ```
 
-The Linux/Pi implementation reuses the existing `CameraPuller`, `FrameSampler`,
-`FrameUplink`, signed envelopes, sequence counter, SQLite spool, and heartbeat
-contract. The Android implementation uses the same v1 control payloads, signed
-live-frame protocol and envelope signatures.
-
-Inference is CLOUD only, in both agents: neither loads a model or detects falls
-on the device. The agent uploads sampled frames to the server
-(`POST /agents/{id}/inference`), which runs the fall detector through
-mantau-core, stores and pushes the falls it finds, and returns them so the agent
-can attach a review clip. When the server offers no inference
-(`GET /inference/capability`), the agent does not fall back to anything local:
-it reports degraded health, detects nothing, and asks the server again until
-it is back.
+The Linux/Pi implementation reuses the existing `CameraPuller`, `FrameSampler`, core
+detector protocol and adapters, `FrameUplink`, signed envelopes, sequence
+counter, SQLite spool, and heartbeat contract. The Android implementation uses
+the same v1 control payloads, signed live-frame protocol, envelope signatures,
+and golden fixtures. Both running agents use CLOUD inference only. They do not
+initialize local fall models or emit local detection events. The server runs
+the fall and activity rules on signed sampled frames. Existing EDGE/HYBRID
+values in stored configurations remain readable and resolve to CLOUD.
+If server inference is unavailable, both agents keep control/configuration
+available and report degraded monitoring. Capability probing and fresh-frame
+retries recover cloud inference without reenrollment.
 
 ### Activity rules
 
-Besides falls, the server runs mantau-core's activity rules on the pose
-observations of the frames the agent uploads, without extra models: prolonged
-position (on the floor, or anywhere outside a seating/bed zone), nocturnal
-movement (repeated bed exits or time out of bed inside the night window) and
-bathroom duration (someone entered the bathroom-door zone and has not been seen since). Each raises a
-warning and later a critical event with its own `kind`, deduplicated by a
+Besides falls, the server runs mantau-core's activity rules on the same pose
+observations, without extra models: prolonged position (on the floor, or
+anywhere outside a seating/bed zone), nocturnal movement (repeated bed exits
+or time out of bed inside the night window) and bathroom duration (someone
+entered the bathroom-door zone and has not been seen since). Each raises a
+warning and later a critical event with its own `kind`, except floor stillness
+which emits one critical event at its saved threshold (30 seconds for new/reset
+settings). Events are deduplicated by a
 stable event id; signals carry only durations, movement, counts and
 confidence, never images or identities. Timers pause while the camera is
 disconnected, the person is lost or confidence is low. Thresholds, the night
-window and zones come from the camera's detection settings. The agent keeps
-its copy too: the saved settings are applied on start and every
-`apply_detection_settings` command replaces them (the command channel must be
-enabled).
+window and zones come from the camera's detection settings: the saved copy is
+applied by the server to the frames it analyses.
 
 ## Linux / Raspberry Pi installation
 
@@ -76,10 +74,16 @@ installed systemd unit uses `Restart=always`, so remote restart/reconfigure
 commands can exit cleanly and be relaunched (an explicit `systemctl stop` is
 still respected):
 
-1. Enter the Mantau server URL and device name. Enrollment is persisted
-   immediately, so an interrupted camera step does not enroll the same agent
-   again.
-2. ONVIF discovery deduplicates devices by host and probes each one over RTSP.
+1. Enter the Mantau server URL, the **enrollment key** from the Mantau app
+   (Beranda > Tambah perangkat; single use, valid for an hour), and a device
+   name. The agent joins that household under a generated id and stores its
+   own secret; nobody types or sees the secret. Enrollment is persisted
+   immediately, so an interrupted camera step does not enroll again.
+2. Normal installation uses `setup --remote`: finish camera discovery/manual
+   entry, credentials and validation in the family app. Credentials are entered
+   once and delivered to the agent in an authenticated durable command.
+   The following local steps describe advanced standalone `setup` only.
+   ONVIF discovery deduplicates devices by host and probes each one over RTSP.
    A single result is offered directly. Multiple results always require an
    explicit numbered choice; Enter never silently selects the first camera.
 3. Use the manual address option for cameras without ONVIF or when multicast is
@@ -88,13 +92,13 @@ still respected):
 4. Setup opens the selected RTSP stream and decodes one frame before saving it.
    When a substream is configured, setup validates and persists it as the
    preferred runtime profile.
-5. Setup asks for no inference mode: fall detection runs on the server (CLOUD).
-   The stored mode stays `AUTO`. The service starts and is enabled for future
-   boots.
+5. Server inference (`CLOUD`) is selected. The service starts and is enabled
+   for future boots.
 
 After installation and configuration, routine operation requires no SSH or
 interactive login. systemd starts the agent at boot and restarts it after a
-failure; camera and server outages are retried internally. Configuration,
+failure; camera and frame-upload outages are retried internally. If server
+inference is unavailable at startup, the agent stays degraded and probes recovery. Configuration,
 sequence state, acknowledged spool state, and health survive service restarts.
 
 Useful local service commands are:
@@ -119,27 +123,11 @@ sudo sh packaging/uninstall.sh
 Only `packaging/uninstall.sh --purge` removes `/etc/mantau-agent`,
 `/var/lib/mantau-agent`, and the service account.
 
-## Android Agent installation
+## Android Agent
 
-Build the independent native project with Android SDK 36 and JDK 17 or 21:
-
-```powershell
-cd android-agent
-.\gradlew.bat testDebugUnitTest assembleDebug
-adb install -r app\build\outputs\apk\debug\app-debug.apk
-```
-
-Open **Mantau Agent** on the spare Android 8.0+ phone, enter the server URL and
-device name, enroll, then copy its claim code into `mantau-app`. Discover ONVIF
-cameras only while the phone is connected to the CCTV Wi-Fi, or use manual
-IP/RTSP configuration. Select a substream path when available, save, grant the
-notification permission, and start the foreground monitoring service.
-
-Android identity/configuration is stored in private app storage; agent/camera
-secrets and in-flight credential-bearing commands are encrypted with an Android
-Keystore AES-GCM key. The persistent notification reports failure/degraded
-state without credentials. See `android-agent/README.md` for Android build,
-installation, permission, security, RTSP, and hardware-test details.
+The native Android Agent lives in its own repository, `mantau-android-agent`,
+with its own build, tests, and APK releases. Installation, permissions,
+security, and RTSP details are in that repository's README.
 
 ## Camera setup behavior
 
@@ -188,19 +176,27 @@ The agent does not log agent secrets or camera passwords. Its status and
 discovery JSON contain no credentials. Linux directory/file permissions are
 the confidentiality boundary; protect device administrator access and backups.
 
-Existing `MANTAU_*` environment variables and `.env` files remain supported for
-Docker and CI. Explicit environment values override durable state. A fully
-environment-configured process does not require `config.json`:
+Unattended enrollment, without prompts:
+
+```sh
+mantau-agent --server-url https://server.example setup --remote \
+  --key MTU-XXXXX-XXXXX-XXXXX-XXXXX --name "Ruang tamu"
+```
+
+For Docker, set `MANTAU_ENROLLMENT_KEY` (plus `MANTAU_SERVER_URL`, optionally
+`MANTAU_DEVICE_NAME`): the first `run` with no saved enrollment enrolls once
+and writes `config.json`; camera setup then continues from the app. Explicit
+environment values override durable state, and a process whose camera is
+configured by environment does not need camera setup from the app:
 
 ```sh
 MANTAU_SERVER_URL=http://server:8100 \
-MANTAU_AGENT_ID=agent-1 \
-MANTAU_AGENT_SECRET='<secret>' \
+MANTAU_ENROLLMENT_KEY=MTU-XXXXX-XXXXX-XXXXX-XXXXX \
 MANTAU_CAMERA_ID=cam-1 \
 MANTAU_CAMERA_HOST=192.168.1.42 \
 MANTAU_CAMERA_SUB_PATH=/stream2 \
 MANTAU_DEFAULT_STREAM_PROFILE=sub \
-MANTAU_INFERENCE_MODE=AUTO \
+MANTAU_INFERENCE_MODE=CLOUD \
 python -m mantau_agent.main run
 ```
 
@@ -210,14 +206,19 @@ The principal runtime variables are:
 |---|---|---|
 | `MANTAU_CONFIG_PATH` | `data/config.json` | Durable setup state path used by CLI/default run |
 | `MANTAU_SERVER_URL` | `http://localhost:8100` | Server base URL |
-| `MANTAU_AGENT_ID`, `MANTAU_AGENT_SECRET` | empty | Enrollment identity |
+| `MANTAU_ENROLLMENT_KEY`, `MANTAU_DEVICE_NAME` | empty | One-time enrollment for unattended installs |
+| `MANTAU_AGENT_ID`, `MANTAU_AGENT_SECRET` | from `config.json` | Saved by enrollment; override only to reuse an existing identity |
 | `MANTAU_CAMERA_HOST`, `MANTAU_CAMERA_PORT` | empty, `554` | Manual/discovery fallback |
 | `MANTAU_CAMERA_MAIN_PATH`, `MANTAU_CAMERA_SUB_PATH` | `/stream1`, unset | RTSP profiles |
 | `MANTAU_DEFAULT_STREAM_PROFILE` | `sub` | Preferred profile; core falls back to main if no sub path exists |
-| `MANTAU_INFERENCE_MODE` | `AUTO` | Accepted for compatibility (`AUTO`, `EDGE`, `CLOUD`, `HYBRID`); every value runs as CLOUD |
-| `MANTAU_CLOUD_UPLOAD_FPS` | `15` | Frames per second uploaded for server inference (at most 15, the server's cap; a lower server `max_fps` lowers it further) |
-| `MANTAU_CLOUD_INFERENCE_ENABLED` | `true` | Use server inference when the server offers it; without it the agent detects nothing |
-| `MANTAU_INFERENCE_PROBE_INTERVAL_S` | `60` | How often an agent without server inference asks the server again; when it is back the service restarts to use it |
+| `MANTAU_INFERENCE_MODE` | `CLOUD` | Existing saved values are treated as CLOUD at runtime |
+| `MANTAU_DETECTOR_BACKEND` | `null` | Retained for old configs; no local model is loaded |
+| `MANTAU_MODEL_DIR` | packaged | Retained for old configs; ignored by this runtime |
+| `MANTAU_FALL_CLASSIFIER_ENABLED` | `true` | Retained for old configs; ignored by this runtime |
+| `MANTAU_DETECTION_FPS` | `15` | Retained for old configs; local detection is disabled |
+| `MANTAU_CLOUD_UPLOAD_FPS` | `10` | Frames per second uploaded for server inference (capped by the server's `max_fps`; below ~10 fps the fall tracker loses people mid-fall) |
+| `MANTAU_CLOUD_INFERENCE_ENABLED` | `true` | Must remain enabled; server inference is required |
+| `MANTAU_HYBRID_CONFIRMATION_FPS` | `0.2` | Retained for old configs; ignored by this runtime |
 | `MANTAU_LIVE_VIEW_FPS` | `4` | Independent live-view rate |
 | `MANTAU_FRAME_QUEUE_SIZE` | `2` | Pending frames per route; oldest drops first |
 | `MANTAU_SEQ_PATH`, `MANTAU_SPOOL_PATH` | under `data/` | Durable uplink state |
@@ -254,33 +255,19 @@ To roll back, disable command polling and restart the service; event/frame
 uplinks and existing configuration are unchanged. The server may retain command
 history and additive tables without affecting the old agent.
 
-## Inference modes and server boundary
+## Server inference boundary
 
-Inference is CLOUD only. `InferenceMode` keeps its four values so that a
-stored or requested mode still loads, but every one of them runs as CLOUD:
-
-| Mode | Effective behavior |
-|---|---|
-| `AUTO` (default), `CLOUD` | Upload sampled frames to `POST /agents/{id}/inference`; the server runs the fall detector, stores and pushes falls under this agent, and returns them (a review clip is attached). |
-| `EDGE`, `HYBRID` | Accepted from `config.json`, `MANTAU_INFERENCE_MODE` or a `set_inference_mode` command and stored as given; they run as CLOUD. |
-
-There is no local fallback. When the server offers no inference, the agent
-detects nothing: health reports `degraded` with the reason "server inference
-unavailable", the heartbeat reports no detector, and the agent asks the server
-again every `MANTAU_INFERENCE_PROBE_INTERVAL_S`; once the server offers
-inference, the process exits so its supervisor restarts it, and it uploads
-again. The systemd unit's `Restart=always` does this; in Docker, run the
-container with a restart policy (for example `docker run --restart
-unless-stopped`), or it stays stopped. Capability reports list
-`AUTO` and `CLOUD` as supported and recommend `CLOUD`. Settings of the removed
-on-device detector (`MANTAU_DETECTOR_BACKEND`, `MANTAU_MODEL_DIR`,
-`MANTAU_FALL_CLASSIFIER_ENABLED`, `MANTAU_DETECTION_FPS`,
-`MANTAU_HYBRID_CONFIRMATION_FPS`) are ignored.
+`CLOUD` uploads sampled frames to `POST /agents/{id}/inference`; the server
+runs fall and activity detection, stores events, and sends alerts. The agent
+advertises only `AUTO` and `CLOUD` as compatible modes, recommends `CLOUD`,
+and treats old saved mode choices as `CLOUD`. Control commands requesting EDGE
+or HYBRID are refused. No local fall model loads. `NullDetector` remains in
+source for isolated wiring tests but is not constructed by the runtime.
 
 Server inference uses its own signed endpoint (`mantau_core.contracts.inference`),
 never the live-view frame endpoint. `HttpInferenceUplink` reads the server's
-capability at startup; if the server does not offer inference, the agent
-reports `cloud_available=false` and uploads nothing for inference. Each frame is signed over
+capability at startup; startup fails when the server cannot offer inference.
+Each frame is signed over
 every header and its bytes, refused locally above the server's size limit,
 retried at most once on a network/5xx error with the same frame id (the server
 answers a retry without re-running the detector), dropped once older than the
@@ -341,7 +328,11 @@ enabled because the agent is headless.
 
 ## Development and verification
 
-Requires Python 3.10-3.12 and the sibling `../mantau-core` checkout.
+Requires Python 3.10-3.12. requirements.txt installs the immutable core ref;
+an adjacent source checkout is optional for development. Installed systemd and
+Docker runtimes require HTTPS; explicit MANTAU_REQUIRE_HTTPS=false is for local
+development only. Envelopes are bounded to 10,000 rows/16 MiB serialized data;
+capacity rejection is logged and counted without deleting pending entries.
 
 ```powershell
 py -3.12 -m venv .venv

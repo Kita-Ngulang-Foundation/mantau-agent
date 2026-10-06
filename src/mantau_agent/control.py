@@ -123,7 +123,7 @@ class CommandExecutor:
                 "supported_inference_modes": caps.get("supported_inference_modes", ["AUTO"]),
                 "recommendation_reason": caps.get("recommendation_reason"),
             },
-            "setup_status": "active" if self.settings.camera_host else "not_started",
+            "setup_status": "active" if not health["routing"].get("degraded", True) else "configuring_camera" if self.settings.camera_host else "not_started",
             "health_state": "degraded" if (health["routing"].get("degraded") or not health["camera"]["connected"]) else "online",
             "requested_inference_mode": self.settings.inference_mode.value,
             "effective_inference_mode": health["effective_inference_mode"],
@@ -151,6 +151,22 @@ class CommandExecutor:
             )
 
     async def _execute(self, command: ControlCommand) -> tuple[dict, str]:
+        if command.command_type is CommandType.REMOVE_CAMERA:
+            current = self.config_store.load()
+            camera_id = command.payload.get('camera_id')
+            if current is not None and current.camera is not None and current.camera.camera_id == camera_id:
+                self.config_store.save(current.model_copy(update={
+                    'camera': None, 'detection_settings': None, 'setup_state': SetupState.ENROLLED,
+                }))
+                # Do not retain deleted camera credentials in the automatic rollback file.
+                self.config_store.backup_path.unlink(missing_ok=True)
+                self.pipeline.router._accepting = False
+                self.pipeline.router._discard_pending()
+                if self.pipeline.router.clips is not None:
+                    self.pipeline.router.clips.clear_capture()
+                await asyncio.to_thread(self.pipeline.puller.stop)
+                self.restart_requested()
+            return {'camera_id': camera_id}, 'Camera capture removed.'
         if command.command_type is CommandType.DISCOVER:
             template = self._camera(command.payload)
             candidates = await discover_cameras(template, profile=StreamProfile.SUB)

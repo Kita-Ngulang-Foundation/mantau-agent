@@ -34,11 +34,12 @@ async def rig():
     def create(mode=Mode.CLOUD, **kwargs):
         cloud = kwargs.pop("inference_uplink", Cloud())
         kwargs.setdefault("cloud_upload_fps", 1.0)
+        viewers = kwargs.pop("viewers", 1)
         live = []
 
         def handler(request):
             live.append(request)
-            return httpx.Response(204)
+            return httpx.Response(204, headers={"X-Mantau-Live-Viewers": str(viewers)})
 
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         clients.append(client)
@@ -188,3 +189,24 @@ async def test_mode_change_does_not_interrupt_active_upload(rig):
     await feed(router, now, [1000])
     assert router.mode == Mode.CLOUD
     assert len(cloud.calls) == 2
+
+async def test_live_view_idles_until_someone_watches(rig):
+    router, _, live, now = rig(Mode.CLOUD, live_view_fps=10, viewers=0)
+    await router.start()
+    await feed(router, now, range(0, 2001, 100))
+    assert len(live) == 3
+
+async def test_post_start_cloud_loss_and_recovery_changes_protection(rig):
+    router, cloud, _, now = rig()
+    await router.start()
+    assert router.health()['degraded']
+    await feed(router, now, [0])
+    assert not router.health()['degraded']
+    cloud.outcome = False
+    await feed(router, now, [1000])
+    assert router.health()['degraded']
+    cloud.outcome = True
+    await feed(router, now, [2000])
+    assert not router.health()['degraded']
+    now[0] = 18
+    assert router.health()['degraded']

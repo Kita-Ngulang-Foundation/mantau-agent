@@ -3,24 +3,25 @@
 # via buildx+QEMU) -- not a runtime image, just a build environment. Build
 # context is mantau-prototype/ (this repo's sibling), same as the real
 # Dockerfile, since it needs the mantau-core sibling package too.
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim-bookworm@sha256:54c85f3c47607a77f32adec749d3c81d1348bf25833671f512b26a9b6d778cb3
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg libgl1 libglib2.0-0 binutils \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
-COPY mantau-core/pyproject.toml mantau-core/README.md /src/mantau-core/
-COPY mantau-core/src /src/mantau-core/src
+COPY mantau-agent/mantau-core.ref /src/mantau-core.ref
 COPY mantau-agent/pyproject.toml mantau-agent/README.md /src/mantau-agent/
 COPY mantau-agent/src /src/mantau-agent/src
 COPY mantau-agent/packaging/entrypoint.py /src/mantau-agent/packaging/entrypoint.py
 
-RUN pip install --no-cache-dir -e /src/mantau-core \
+RUN ref="$(tr -d '[:space:]' < /src/mantau-core.ref)" \
+ && pip install --no-cache-dir "mantau-core @ https://github.com/Kita-Ngulang-Foundation/mantau-core/archive/${ref}.tar.gz" \
  && pip install --no-cache-dir -e /src/mantau-agent \
  && pip install --no-cache-dir pyinstaller
 
 WORKDIR /src/mantau-agent
 ENTRYPOINT ["python", "-m", "PyInstaller", "--onefile", \
+            "--collect-data", "mantau_core", \
             "--workpath", "/tmp/build", "--specpath", "/tmp/build", \
             "--distpath", "/out", "packaging/entrypoint.py"]
