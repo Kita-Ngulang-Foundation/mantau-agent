@@ -47,6 +47,22 @@ if [ ! -f "$BINARY_PATH" ]; then
     exit 1
 fi
 
+# The frozen Python binary does not bundle the OS FFmpeg executable. Require
+# H.264 encoding on installed devices so review clips play on caregiver phones.
+if ! command -v ffmpeg >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update
+        apt-get install -y --no-install-recommends ffmpeg
+    else
+        echo "Install FFmpeg (with libx264) before installing this agent." >&2
+        exit 1
+    fi
+fi
+if ! ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libx264; then
+    echo "FFmpeg must include the libx264 encoder for caregiver review clips." >&2
+    exit 1
+fi
+
 if ! getent group "$SERVICE_USER" >/dev/null 2>&1; then
     groupadd --system "$SERVICE_USER"
 fi

@@ -20,6 +20,7 @@ from .sampler import FrameSampler
 class FrameWork:
     image: object
     ts_ms: int
+    captured_at_ms: int | None = None
 
 
 class InferenceRouter:
@@ -67,7 +68,14 @@ class InferenceRouter:
         self.upload_failures = {"cloud": 0, "live": 0}
         self.last_error: str | None = None
         self._last_attempt: dict[str, float] = {}
+        self._live_slots = asyncio.Semaphore(3)
+        self._live_tasks: set[asyncio.Task] = set()
         self._last_ts: int | None = None
+        self._capture_offset_ms = None
+        self._last_processed = None
+        self._last_processed_at = None
+        self._last_capture = None
+        self._cloud_error = None
         self._tasks: list[asyncio.Task] = []
         self._running = False
         self._accepting = False
@@ -84,12 +92,16 @@ class InferenceRouter:
         return False
 
     def health(self) -> dict:
+        fresh = (self._last_processed is not None and self._last_capture is not None
+                 and self._clock()-min(self._last_processed,self._last_capture) <= 15
+                 and self._cloud_error is None)
         return {
             "mode": self.mode.value, "requested_mode": self.requested_mode.value,
             "reason": self.selection.reason,
             "running": self._running, "detector_alive": self.detector_alive,
-            "cloud_available": self.inference_uplink is not None,
-            "degraded": self.inference_uplink is None,
+            "cloud_available": fresh,
+            "last_inference_at": self._last_processed_at,
+            "degraded": not fresh,
             "queue_depths": {k: q.qsize() for k, q in self._queues.items()},
             "dropped_frames": dict(self.dropped), "upload_failures": dict(self.upload_failures),
             "last_error": self.last_error,
@@ -126,7 +138,10 @@ class InferenceRouter:
         if not self._accepting or (self._last_ts is not None and ts_ms <= self._last_ts):
             return
         self._last_ts = ts_ms
-        work = FrameWork(image, ts_ms)
+        observed = time.time()*1000-ts_ms
+        self._capture_offset_ms = observed if self._capture_offset_ms is None else min(self._capture_offset_ms,observed)
+        work = FrameWork(image, ts_ms, int(ts_ms+self._capture_offset_ms))
+        self._last_capture = self._clock()
         if self.clips is not None:
             try:
                 self.clips.add_frame(image, ts_ms)
@@ -135,6 +150,7 @@ class InferenceRouter:
         if (self.inference_uplink is not None and self._sampler.should_keep(ts_ms)
                 and self._cloud_sampler.should_keep(ts_ms)):
             self._enqueue("cloud", work)
+        # Live view in every mode: family members watch whatever the camera sees.
         if self.live_view_enabled and self._live_sampler.should_keep(ts_ms):
             self._enqueue("live", work)
 
@@ -150,11 +166,13 @@ class InferenceRouter:
                 # Boundary around third-party transport implementations.
                 self.last_error = f"{name}: {type(exc).__name__}"
                 self.upload_failures[name] += 1
+                if name == "cloud":
+                    self._cloud_error = type(exc).__name__
             finally:
                 queue.task_done()
 
     async def _upload(self, name: str, work: FrameWork) -> None:
-        rate = self.live_view_fps if name == "live" else self.cloud_upload_fps
+        rate = self._live_rate() if name == "live" else self.cloud_upload_fps
         now = self._clock()
         if name in self._last_attempt and now - self._last_attempt[name] + 1e-9 < 1.0 / rate:
             self.dropped[name] += 1
@@ -162,17 +180,47 @@ class InferenceRouter:
         jpeg = await asyncio.to_thread(self.frame_uplink.encode, work.image)
         if jpeg is None:
             self.upload_failures[name] += 1
+            if name == "cloud":
+                self._cloud_error = "jpeg_encode_failed"
             return
         # Measure from the actual send, after potentially slow JPEG encoding.
         # Failures and mode changes do not reset this attempt budget.
         self._last_attempt[name] = self._clock()
         if name == "live":
-            request = self.frame_uplink.push(jpeg)
+            # A round trip to the server is longer than a video frame
+            # interval, so several live frames are in flight at once.
+            await self._live_slots.acquire()
+            task = asyncio.create_task(self._push_live(jpeg, work.captured_at_ms))
+            self._live_tasks.add(task)
+            task.add_done_callback(self._live_tasks.discard)
+            return
         else:
             request = self.inference_uplink.submit(jpeg, camera_id=self.camera_id,
                                                    ts_ms=work.ts_ms)
         if not await asyncio.wait_for(request, timeout=self.upload_timeout_s):
             self.upload_failures[name] += 1
+            self._cloud_error = "inference_not_processed"
+        else:
+            self._last_processed = self._clock()
+            self._last_processed_at = time.time()
+            self._cloud_error = None
+
+    async def _push_live(self, jpeg: bytes, captured_at_ms: int | None) -> None:
+        try:
+            pushed = await asyncio.wait_for(
+                self.frame_uplink.push(jpeg, captured_at_ms=captured_at_ms),
+                timeout=self.upload_timeout_s)
+            if not pushed:
+                self.upload_failures["live"] += 1
+        except Exception as exc:  # noqa: BLE001 -- a lost frame is just dropped
+            self.upload_failures["live"] += 1
+            self.last_error = f"live: {type(exc).__name__}"
+        finally:
+            self._live_slots.release()
+
+    def _live_rate(self) -> float:
+        current = getattr(self.frame_uplink, "current_fps", None)
+        return min(self.live_view_fps, current()) if callable(current) else self.live_view_fps
 
     def _discard_pending(self) -> None:
         for name, queue in self._queues.items():
@@ -184,6 +232,8 @@ class InferenceRouter:
     async def wait_idle(self) -> None:
         for queue in self._queues.values():
             await queue.join()
+        if self._live_tasks:
+            await asyncio.gather(*list(self._live_tasks), return_exceptions=True)
 
     async def change_mode(self, mode: InferenceMode) -> None:
         """Record the requested mode; the effective mode stays CLOUD."""

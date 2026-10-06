@@ -185,6 +185,8 @@ class MonitoringPipeline:
             "pid": os.getpid(),
             "observed_at": datetime.now(timezone.utc).isoformat(),
             "version": self.router.capabilities.software_version,
+            "spool_rejections": getattr(self.uplink, 'spool_rejections', 0),
+            "uplink_error": getattr(self.uplink, 'last_error', None),
             "started_at": self._started_at.isoformat() if self._started_at else None,
             "uptime_seconds": max(0.0, uptime),
             "camera": {

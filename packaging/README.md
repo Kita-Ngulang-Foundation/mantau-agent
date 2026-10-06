@@ -18,7 +18,10 @@ Outputs:
 - `dist/mantau-agent-linux-arm64`
 
 The build context is the parent `mantau-prototype` directory because the agent
-depends on the sibling `mantau-core` package. PyInstaller must build on the same
+build recipe lives under the agent subdirectory. Its core package is fetched
+from the exact mantau-core.ref, without trusting a sibling checkout. The OS
+FFmpeg executable is installed separately on the target by install.sh and must
+include libx264. PyInstaller must build on the same
 OS family and architecture it targets; buildx supplies the architecture-specific
 Linux environment. Building is not proof that camera codecs or detector
 accelerators work on a target, so run the resulting artifact on representative
@@ -54,13 +57,15 @@ The idempotent installer:
 - creates `/etc/mantau-agent` and `/var/lib/mantau-agent` as private,
   service-owned directories;
 - installs the systemd unit with restart, hardening, and explicit writable paths;
-- runs enrollment and displays the claim code when no configuration exists;
+- asks for the server URL and an enrollment key from the Mantau app when no
+  configuration exists, and enrolls;
 - starts the command worker before a camera is configured, so setup can finish
   from the separate Mantau app phone. The private configuration directory is
   writable by the service to persist validated remote camera changes.
 
-For manual enrollment without the installer, use `mantau-agent setup --remote`
-followed by `mantau-agent run`. The existing `mantau-agent setup` command retains
+For manual enrollment without the installer, use
+`mantau-agent --server-url <url> setup --remote --key <enrollment key>` followed
+by `mantau-agent run`. The existing `mantau-agent setup` command retains
 interactive local camera validation. File-based enrollment enables command
 polling; legacy environment-only installations retain their previous default.
 
@@ -118,5 +123,5 @@ then validate RTSP capture, service restart, and outage spool recovery on the
 actual target class.
 
 The native Android Agent is a separate application and release path. See
-`../android-agent/README.md`; it does not use these PyInstaller or systemd
+the `mantau-android-agent` repository; it does not use these PyInstaller or systemd
 artifacts.

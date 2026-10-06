@@ -20,7 +20,7 @@ from .activity_rules import build_activity_rules
 from .clips import ClipRecorder, ClipUploader
 from . import __version__
 from .camera.puller import CameraPuller
-from .capabilities import inspect_capabilities
+from .capabilities import InferenceMode, inspect_capabilities
 from .config import Settings, load_settings
 from .control import CommandExecutor, CompletedCommandStore, ControlPlaneWorker
 from .detect.router import InferenceRouter
@@ -85,33 +85,31 @@ async def build_pipeline(settings: Settings, *,
                          configuration_store=None) -> MonitoringPipeline:
     """Build the monitoring pipeline.
 
-    Inference is CLOUD only: unless an adapter is injected (tests), the
-    server's `GET /inference/capability` decides whether an
-    `HttpInferenceUplink` exists. Without one the agent detects nothing,
-    reports degraded health and keeps asking the server; there is no local
-    fallback. Ownership of the adapter transfers to the returned pipeline only
-    after successful construction.
+    Server inference is required. Unless an adapter is injected (tests),
+    `GET /inference/capability` must advertise an available detector. Local
+    detector settings are ignored and no local model is initialized.
     """
     if not settings.agent_id or not settings.agent_secret:
         raise SystemExit(
-            "MANTAU_AGENT_ID and MANTAU_AGENT_SECRET must be set -- enroll this agent "
-            "against the server first (POST /agents/enroll) and copy the secret it returns."
+            "This agent is not enrolled -- run `mantau-agent setup --key <enrollment key>` "
+            "with a key from the Mantau app (Beranda > Tambah perangkat)."
         )
 
+    if not settings.cloud_inference_enabled:
+        raise RuntimeError("Server inference is required; enable MANTAU_CLOUD_INFERENCE_ENABLED")
+    settings.inference_mode = InferenceMode.CLOUD
     camera = await _discover_camera(settings)
     cloud_upload_fps = settings.cloud_upload_fps
     owned_uplink = None
     inference_probe = None
-    if inference_uplink is None and settings.cloud_inference_enabled:
+    if inference_uplink is None:
         capability = await discover_capability(settings.server_url)
         if capability is not None and capability.available:
             inference_uplink = owned_uplink = HttpInferenceUplink(
                 settings.server_url, settings.agent_id, settings.agent_secret, capability)
             cloud_upload_fps = cloud_rate(settings.cloud_upload_fps, capability)
         else:
-            logging.getLogger(__name__).warning(
-                "Server inference unavailable (%s); detecting nothing until it is back",
-                capability.reason if capability is not None else "no capability response")
+            logging.getLogger(__name__).warning("Server inference unavailable; capturing without protection until recovery")
 
             async def inference_probe() -> bool:
                 offered = await discover_capability(settings.server_url)
@@ -128,7 +126,8 @@ async def build_pipeline(settings: Settings, *,
         cleanup.push_async_callback(uplink.close)
         frames = FrameUplink(
             settings.server_url, settings.agent_id, settings.agent_secret, settings.camera_id,
-            fps=settings.live_view_fps, jpeg_quality=settings.live_view_jpeg_quality,
+            fps=settings.live_view_fps, idle_fps=settings.live_view_idle_fps,
+            jpeg_quality=settings.live_view_jpeg_quality,
             max_width=settings.live_view_max_width,
         )
         cleanup.push_async_callback(frames.close)
@@ -233,40 +232,16 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("run", help="run the monitoring service")
     setup = commands.add_parser("setup", help="enroll and select a validated camera")
     setup.add_argument("--remote", action="store_true", help="enroll now; configure camera from Mantau app")
+    setup.add_argument("--key", dest="enrollment_key",
+                       help="enrollment key from the Mantau app (Beranda > Tambah perangkat)")
+    setup.add_argument("--name", help="device name shown in the Mantau app")
     setup.add_argument("--restore-backup", action="store_true",
                        help="restore the last known-good configuration before setup")
     status = commands.add_parser("status", help="show the last local health snapshot")
     status.add_argument("--json", action="store_true", dest="as_json")
-    commands.add_parser("claim-code", help="show a fresh claim code for the Mantau app")
-    commands.add_parser("rotate-key", help="replace this agent's secret (proves the current one)")
     discovery = commands.add_parser("discover", help="discover and probe ONVIF cameras")
     discovery.add_argument("--json", action="store_true", dest="as_json")
     return parser
-
-
-def _enrollment_command(command: str, config_path: str | None) -> int:
-    from .setup_wizard import AlreadyClaimed, refresh_claim_code, rotate_secret
-    from .state import ConfigurationStore
-    store = ConfigurationStore(config_path)
-    configuration = store.load()
-    if configuration is None or not configuration.enrollment.agent_secret:
-        print("This agent is not enrolled yet; run `mantau-agent setup --remote`.")
-        return 1
-    enrollment = configuration.enrollment
-    if command == "rotate-key":
-        rotate_secret(store)
-        print("Agent secret rotated. Restart the service to use it.")
-        return 0
-    try:
-        code = refresh_claim_code(enrollment.server_url, enrollment.agent_id,
-                                  enrollment.agent_secret)
-    except AlreadyClaimed:
-        print("This agent already belongs to a household. The owner must remove it "
-              "in the Mantau app before it can be claimed again.")
-        return 1
-    print(f"Claim code: {code}")
-    print("Enter it in the Mantau app within a few minutes; it works once.")
-    return 0
 
 
 def _print_value(value, *, as_json: bool) -> None:
@@ -311,8 +286,6 @@ def cli(argv: list[str] | None = None) -> int:
             store.restore_backup()
             print(f"Restored configuration from {store.backup_path}.")
             return 0
-        if command in ("claim-code", "rotate-key"):
-            return _enrollment_command(command, args.config)
         settings, configuration = load_settings(args.config)
         if args.status_path:
             settings.status_path = args.status_path
@@ -323,7 +296,8 @@ def cli(argv: list[str] | None = None) -> int:
             from .setup_wizard import run_wizard
             from .state import ConfigurationStore
             store = ConfigurationStore(args.config)
-            run_wizard(store, remote=True) if args.remote else run_wizard(store)
+            run_wizard(store, remote=args.remote, server_url=args.server_url,
+                       enrollment_key=args.enrollment_key, name=args.name)
             return 0
         if command == "status":
             status = StatusStore(settings.status_path).read() or {
@@ -338,10 +312,22 @@ def cli(argv: list[str] | None = None) -> int:
             candidates = asyncio.run(_discover_command(settings))
             _print_value(candidates, as_json=args.as_json)
             return 0
-        from .setup_wizard import needs_setup
+        from .setup_wizard import enroll_and_save, needs_setup
+        if (settings.enrollment_key and not settings.agent_secret
+                and (configuration is None or not configuration.enrollment.agent_secret)):
+            # Unattended first start (Docker): enroll, then wait for camera
+            # setup from the app. The key is single-use, so this runs once.
+            from .state import ConfigurationStore
+            enroll_and_save(ConfigurationStore(args.config), settings.server_url,
+                            settings.enrollment_key, name=settings.device_name or None)
+            settings, configuration = load_settings(args.config)
+            if args.status_path:
+                settings.status_path = args.status_path
+            if args.server_url:
+                settings.server_url = args.server_url
         if needs_setup(settings, configuration):
             raise RuntimeError(
-                "Setup is incomplete; run `mantau-agent setup` or provide MANTAU_* variables")
+                "Setup is incomplete; run `mantau-agent setup` or set MANTAU_ENROLLMENT_KEY")
         asyncio.run(run(settings, config_path=args.config))
         return 0
     except (RuntimeError, ValueError, OSError) as exc:

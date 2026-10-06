@@ -7,6 +7,8 @@ test_main_factories.py's docstring).
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -82,34 +84,56 @@ def test_render_env_file_includes_sub_stream_and_credentials_when_given():
     assert "MANTAU_CAMERA_PASSWORD=admin123" in text
 
 
-def test_enroll_returns_the_secret_from_a_successful_response():
+def test_enroll_sends_the_key_and_returns_the_secret():
+    seen = []
+
     def handler(request):
         assert request.url.path == "/agents/enroll"
+        seen.append(json.loads(request.content))
         return httpx.Response(201, json={"agent_id": "agent-1", "secret": "fresh-secret"})
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    secret = enroll("http://server.local:8100", "agent-1", client=client)
+    secret = enroll("http://server.local:8100", "MTU-AAAAA-BBBBB-CCCCC-DDDDD", "agent-1",
+                    name="Ruang tamu", client=client)
     assert secret == "fresh-secret"
+    assert seen[0]["enrollment_key"] == "MTU-AAAAA-BBBBB-CCCCC-DDDDD"
+    assert seen[0]["agent_id"] == "agent-1"
+    assert seen[0]["name"] == "Ruang tamu"
+    assert seen[0]["platform"] in {"linux_x86_64", "linux_arm64", "raspberry_pi", "android", "other"}
 
 
-def test_remote_enrollment_displays_claim_without_secret(monkeypatch, tmp_path, capsys):
-    store = ConfigurationStore(tmp_path / 'config.json')
-    monkeypatch.setattr(wizard.sys.stdin, 'isatty', lambda: True)
-    answers = iter(['https://server', 'agent-remote'])
-    monkeypatch.setattr('builtins.input', lambda prompt: next(answers))
-    client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(201, json={
-        'secret': 'private-agent-value', 'claim_code': 'CLAIM123',
+def test_a_rejected_key_says_how_to_get_a_new_one():
+    client = httpx.Client(transport=httpx.MockTransport(
+        lambda request: httpx.Response(401, json={"detail": "invalid_enrollment_key"})))
+    with pytest.raises(wizard.EnrollmentKeyRejected, match="Tambah perangkat"):
+        enroll("http://server.local:8100", "MTU-OLD", "agent-1", client=client)
+
+
+def test_unattended_remote_setup_enrolls_without_a_terminal(monkeypatch, tmp_path, capsys):
+    store = ConfigurationStore(tmp_path / "config.json")
+    monkeypatch.setattr(wizard.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr("builtins.input", lambda prompt: pytest.fail("unexpected prompt"))
+    mock = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(201, json={
+        "agent_id": "x", "secret": "private-agent-value",
     })))
-    monkeypatch.setattr(wizard, 'enroll', lambda url, agent: enroll(url, agent, client=client))
-    configuration = wizard.run_wizard(store, remote=True)
+    monkeypatch.setattr(wizard, "enroll_device",
+                        lambda url, key, name=None, client=None: _enroll_with(url, key, name, mock))
+    configuration = wizard.run_wizard(store, remote=True, server_url="https://server",
+                                      enrollment_key="MTU-KEY", name="Ruang tamu")
     from mantau_agent.config import load_settings
     settings, saved = load_settings(store.path)
     assert configuration.camera is None
     assert settings.command_channel_enabled
+    assert settings.agent_secret == "private-agent-value"
     assert not needs_setup(settings, saved)
     output = capsys.readouterr().out
-    assert 'CLAIM123' in output
-    assert 'private-agent-value' not in output
+    assert "private-agent-value" not in output and "MTU-KEY" not in output
+
+
+def _enroll_with(url, key, name, client):
+    from mantau_agent.state import EnrollmentConfiguration
+    secret = enroll(url, key, "agent-generated", name=name, client=client)
+    return EnrollmentConfiguration(server_url=url, agent_id="agent-generated", agent_secret=secret)
 
 
 def test_enroll_raises_on_an_http_error_instead_of_returning_garbage():
@@ -118,7 +142,7 @@ def test_enroll_raises_on_an_http_error_instead_of_returning_garbage():
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
     try:
-        enroll("http://server.local:8100", "agent-1", client=client)
+        enroll("http://server.local:8100", "MTU-KEY", "agent-1", client=client)
         assert False, "expected an HTTPStatusError"
     except httpx.HTTPStatusError:
         pass
@@ -167,9 +191,9 @@ async def test_camera_setup_prefers_and_validates_configured_substream(monkeypat
 def test_interrupted_setup_persists_enrollment_for_safe_resume(monkeypatch, tmp_path):
     store = ConfigurationStore(tmp_path / "config.json")
     monkeypatch.setattr(wizard.sys.stdin, "isatty", lambda: True)
-    answers = iter(["https://server", "agent-one"])
+    answers = iter(["https://server", "MTU-KEY", "Ruang tamu"])
     monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
-    monkeypatch.setattr(wizard, "enroll", lambda *args: "agent-secret")
+    monkeypatch.setattr(wizard, "enroll", lambda *args, **kwargs: "agent-secret")
 
     async def cancelled(agent_id):
         raise KeyboardInterrupt
@@ -185,10 +209,10 @@ def test_interrupted_setup_persists_enrollment_for_safe_resume(monkeypatch, tmp_
 def test_enrollment_failure_does_not_expose_http_error_details(monkeypatch, tmp_path):
     store = ConfigurationStore(tmp_path / "config.json")
     monkeypatch.setattr(wizard.sys.stdin, "isatty", lambda: True)
-    answers = iter(["https://server.invalid", "agent-one"])
+    answers = iter(["https://server.invalid", "MTU-KEY", "Ruang tamu"])
     monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
 
-    def fail(*args):
+    def fail(*args, **kwargs):
         raise httpx.ConnectError("agent-secret=must-not-appear")
 
     monkeypatch.setattr(wizard, "enroll", fail)
@@ -202,9 +226,9 @@ def test_enrollment_failure_does_not_expose_http_error_details(monkeypatch, tmp_
 def test_completed_setup_persists_camera_and_inference_mode(monkeypatch, tmp_path):
     store = ConfigurationStore(tmp_path / "config.json")
     monkeypatch.setattr(wizard.sys.stdin, "isatty", lambda: True)
-    answers = iter(["https://server", "agent-one"])
+    answers = iter(["https://server", "MTU-KEY", "Ruang tamu"])
     monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
-    monkeypatch.setattr(wizard, "enroll", lambda *args: "agent-secret")
+    monkeypatch.setattr(wizard, "enroll", lambda *args, **kwargs: "agent-secret")
 
     async def selected(agent_id):
         from mantau_agent.state import CameraConfiguration
@@ -213,7 +237,7 @@ def test_completed_setup_persists_camera_and_inference_mode(monkeypatch, tmp_pat
     monkeypatch.setattr(wizard, "_pick_camera_interactive", selected)
     completed = wizard.run_wizard(store)
     assert completed.setup_state is SetupState.COMPLETE
-    assert completed.inference_mode is InferenceMode.AUTO
+    assert completed.inference_mode is InferenceMode.CLOUD
     assert store.load().camera.host == "192.0.2.20"
 
 
@@ -221,53 +245,18 @@ def test_default_agent_ids_do_not_collide_between_identical_devices():
     assert wizard.default_agent_id() != wizard.default_agent_id()
 
 
-def test_enroll_reports_a_taken_id_instead_of_failing():
-    client = httpx.Client(transport=httpx.MockTransport(
-        lambda request: httpx.Response(409, json={"detail": "agent_id_taken"})))
-    try:
-        enroll("http://server.local:8100", "agent-1", client=client)
-        assert False, "expected AgentIdTaken"
-    except wizard.AgentIdTaken:
-        pass
-
-
-def test_rotation_proves_the_current_secret_and_saves_the_new_one(tmp_path):
-    from mantau_agent.state import AgentConfiguration, EnrollmentConfiguration, SetupState
-
-    store = ConfigurationStore(tmp_path / "config.json")
-    store.save(AgentConfiguration(
-        setup_state=SetupState.ENROLLED,
-        enrollment=EnrollmentConfiguration(
-            server_url="https://server", agent_id="agent-1", agent_secret="old-secret"),
-    ))
-    seen = []
+def test_a_taken_generated_id_is_retried_with_a_new_one():
+    ids = []
 
     def handler(request):
-        seen.append(request)
-        return httpx.Response(201, json={"agent_id": "agent-1", "secret": "new-secret"})
+        body = json.loads(request.content)
+        ids.append(body["agent_id"])
+        if len(ids) == 1:
+            return httpx.Response(409, json={"detail": "agent_id_taken"})
+        return httpx.Response(201, json={"agent_id": body["agent_id"], "secret": "s"})
 
-    wizard.rotate_secret(store, client=httpx.Client(transport=httpx.MockTransport(handler)))
-
-    assert seen[0].headers["X-Mantau-Agent-ID"] == "agent-1"
-    assert seen[0].headers["X-Mantau-Agent-Secret"] == "old-secret"
-    assert store.load().enrollment.agent_secret == "new-secret"
-
-
-def test_claim_code_refresh_uses_agent_credentials_and_keeps_the_secret():
-    def handler(request):
-        assert request.url.path == "/agent-control/claim-code"
-        assert request.headers["X-Mantau-Agent-Secret"] == "agent-secret"
-        return httpx.Response(201, json={"claim_code": "FRESH123", "expires_at": "x"})
-
-    code = wizard.refresh_claim_code(
-        "https://server", "agent-1", "agent-secret",
-        client=httpx.Client(transport=httpx.MockTransport(handler)))
-    assert code == "FRESH123"
-
-    claimed = httpx.Client(transport=httpx.MockTransport(
-        lambda request: httpx.Response(409, json={"detail": "agent_already_claimed"})))
-    try:
-        wizard.refresh_claim_code("https://server", "agent-1", "agent-secret", client=claimed)
-        assert False, "expected AlreadyClaimed"
-    except wizard.AlreadyClaimed:
-        pass
+    enrollment = wizard.enroll_device(
+        "https://server/", "MTU-KEY", client=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert len(set(ids)) == 2
+    assert enrollment.agent_id == ids[1]
+    assert enrollment.server_url == "https://server"
