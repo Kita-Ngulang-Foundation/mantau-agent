@@ -88,8 +88,10 @@ class Settings(CoreSettings):
     # Review clips around events (never for bathroom-duration events).
     clips_enabled: bool = True
     clip_fps: float = Field(default=5.0, gt=0, le=15, allow_inf_nan=False)
-    clip_pre_s: float = Field(default=5.0, ge=1, le=30)
-    clip_post_s: float = Field(default=5.0, ge=1, le=30)
+    clip_pre_s: float = Field(default=15.0, ge=1, le=30)
+    clip_post_s: float = Field(default=15.0, ge=1, le=30)
+    # Incident clips stay on this device; only the newest few are kept.
+    clip_max_kept: int = Field(default=5, ge=1, le=20)
     clip_spool_dir: str = "data/clips"
     live_view_enabled: bool = True
     # Video rate while someone watches (the server says so on each upload);

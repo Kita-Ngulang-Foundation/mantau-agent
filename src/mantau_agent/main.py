@@ -10,6 +10,7 @@ import os
 import signal
 import sys
 from contextlib import AsyncExitStack
+from pathlib import Path
 
 from mantau_core.buffer import DurableSpool
 from mantau_core.contracts import CameraRef, Credentials, StreamProfile
@@ -141,9 +142,11 @@ async def build_pipeline(settings: Settings, *,
             clips = ClipRecorder(
                 uploader=ClipUploader(settings.server_url, settings.agent_id,
                                       settings.agent_secret),
-                encode_jpeg=frames.encode, spool_dir=settings.clip_spool_dir,
+                encode_jpeg=frames.encode, spool_dir=Path(settings.clip_spool_dir).expanduser().resolve() / settings.agent_id,
                 fps=settings.clip_fps, pre_s=settings.clip_pre_s, post_s=settings.clip_post_s,
+                max_pending_files=settings.clip_max_kept, retain_local=True,
             )
+            clips.set_enabled(activity.settings.recordings.enabled)
             if owned_uplink is not None:
                 # Events the server detects get a review clip.
                 owned_uplink.on_events = lambda events: [clips.on_event(e) for e in events]

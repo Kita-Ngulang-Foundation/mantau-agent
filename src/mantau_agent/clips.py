@@ -95,11 +95,20 @@ class ClipUploader:
 
     async def upload(self, event_id: str, body: bytes) -> bool | None:
         """True uploaded, False retry later, None never retry."""
+        return await self._upload(event_id, body)
+
+    async def upload_transfer(self, event_id: str, transfer_id: str, body: bytes) -> bool | None:
+        if not re.fullmatch(r"[a-f0-9]{32}", transfer_id):
+            raise ValueError("invalid transfer identifier")
+        return await self._upload(event_id, body, transfer_id)
+
+    async def _upload(self, event_id, body, transfer_id=None):
         signature = hmac.new(self._secret.encode(), event_id.encode() + b"." + body,
                              hashlib.sha256).hexdigest()
         try:
             response = await self._client.post(
                 f"{self.server_url}/events/{event_id}/recording", content=body,
+                params={"transfer_id": transfer_id} if transfer_id else None,
                 headers={"Content-Type": "video/mp4", "X-Mantau-Agent": self.agent_id,
                          "X-Mantau-Signature": signature},
             )
@@ -120,6 +129,7 @@ class _Capture:
     frames: list[bytes]
     remaining: int
     generation: int = 0
+    occurred_at: float | None = None
 
 
 class ClipRecorder:
@@ -128,7 +138,8 @@ class ClipRecorder:
                  post_s: float = 5.0, max_pending_files: int = 50,
                  retry_interval_s: float = 60.0, max_spool_bytes: int = 100 * 1024 * 1024,
                  max_spool_age_s: float = 24 * 60 * 60, max_pending_captures: int = 8,
-                 max_encoding_tasks: int = 2, wall_clock: Callable[[], float] = time.time) -> None:
+                 max_encoding_tasks: int = 2, wall_clock: Callable[[], float] = time.time,
+                 retain_local: bool = False) -> None:
         if any(not math.isfinite(value) or value <= 0
                for value in (fps, pre_s, post_s, retry_interval_s, max_spool_age_s)):
             raise ValueError("Clip rates, durations and retry interval must be positive and finite")
@@ -155,6 +166,8 @@ class ClipRecorder:
         self._retry_task: asyncio.Task | None = None
         self._wall = wall_clock
         self._generation = 0
+        self.retain_local = retain_local
+        self.enabled = True
         self._seen: dict[str, None] = {}
         self.uploaded = 0
         self.failed = 0
@@ -192,7 +205,7 @@ class ClipRecorder:
         self._seen.clear()
 
     def add_frame(self, image, ts_ms: int) -> None:
-        if self._closed or (self._last_ts is not None and ts_ms - self._last_ts < self._interval_ms):
+        if not self.enabled or self._closed or (self._last_ts is not None and ts_ms - self._last_ts < self._interval_ms):
             return
         jpeg = self.encode_jpeg(image)
         if jpeg is None:
@@ -207,7 +220,7 @@ class ClipRecorder:
                 self._spawn(self._finish(capture))
 
     def on_event(self, event: FallEvent) -> None:
-        if self._closed or event.kind is EventKind.BATHROOM_DURATION or event.event_id in self._seen:
+        if not self.enabled or self._closed or event.kind is EventKind.BATHROOM_DURATION or event.event_id in self._seen:
             return
         if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}", event.event_id):
             self._failure("event_id", ValueError("invalid clip identifier"))
@@ -218,7 +231,35 @@ class ClipRecorder:
         if len(self._captures) >= self._max_captures:
             self._failure("capture_capacity", RuntimeError("capture queue full"))
             return
-        self._captures.append(_Capture(event.event_id, list(self._ring), self._post_frames, self._generation))
+        remaining = self._post_frames
+        if self.retain_local:
+            remaining += self._ring.maxlen - len(self._ring)
+        self._captures.append(_Capture(event.event_id, list(self._ring), remaining, self._generation,
+                                       event.occurred_at.timestamp()))
+
+    def set_enabled(self, value: bool) -> None:
+        if value != self.enabled:
+            self.enabled = value
+            self.clear_capture()
+
+    def inventory(self) -> list[dict]:
+        return [{"event_id": path.stem, "size_bytes": path.stat().st_size,
+                 "captured_at_ms": max(0, round(path.stat().st_mtime * 1000))}
+                for path in reversed(self._maintain_spool())
+                if 0 < path.stat().st_size <= 20 * 1024 * 1024][:5]
+
+    async def transfer(self, event_id: str, transfer_id: str) -> bool:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", event_id):
+            raise ValueError("invalid clip identifier")
+        path = self.spool_dir / f"{event_id}.mp4"
+        self._owned(path)
+        if not path.exists() or not 0 < path.stat().st_size <= 20 * 1024 * 1024:
+            return False
+        return await self.uploader.upload_transfer(event_id, transfer_id, path.read_bytes()) is True
+
+    def _owned(self, path: Path) -> None:
+        if self.spool_dir.resolve() != self.spool_dir or path.is_symlink() or path.resolve().parent != self.spool_dir:
+            raise OSError("clip storage is not owned")
 
     def start(self) -> None:
         if not self._closed and self._retry_task is None:
@@ -257,35 +298,42 @@ class ClipRecorder:
         if capture.generation != self._generation:
             return
         try:
-            path = self._store(capture.event_id, body)
+            path = self._store(capture.event_id, body, capture.occurred_at)
         except (OSError, ValueError) as exc:
             self._failure("persistence", exc, persistence=True)
             return
-        await self._send(path)
+        if not self.retain_local:
+            await self._send(path)
 
-    def _store(self, event_id: str, body: bytes) -> Path:
+    def _store(self, event_id: str, body: bytes, occurred_at: float | None = None) -> Path:
         if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}", event_id):
             raise ValueError("invalid clip identifier")
         if not body or len(body) > self._max_spool_bytes:
             raise ValueError("Encoded clip is empty or exceeds the spool byte limit")
         self.spool_dir.mkdir(parents=True, exist_ok=True)
         path = self.spool_dir / f"{event_id}.mp4"
+        self._owned(path)
         if path.exists():
             return path  # Keep the durable original if a duplicate event is replayed.
         spooled = [item for item in self._maintain_spool() if item != path]
         size = sum(item.stat().st_size for item in spooled)
-        while spooled and (len(spooled) >= self._max_pending or size + len(body) > self._max_spool_bytes):
+        if self.retain_local and size + len(body) > self._max_spool_bytes:
+            raise ValueError("clip spool byte limit")
+        while not self.retain_local and spooled and (len(spooled) >= self._max_pending or size + len(body) > self._max_spool_bytes):
             oldest = spooled.pop(0)
             size -= oldest.stat().st_size
             oldest.unlink(missing_ok=True)
             self.evicted_capacity += 1
         partial = path.with_suffix(".part")
+        self._owned(partial)
         try:
             with partial.open("wb") as output:
                 output.write(body)
                 output.flush()
                 os.fsync(output.fileno())
             partial.replace(path)
+            if self.retain_local and occurred_at is not None:
+                os.utime(path, (occurred_at, occurred_at))
             if os.name != "nt":
                 directory_fd = os.open(self.spool_dir, os.O_RDONLY)
                 try:
@@ -295,19 +343,24 @@ class ClipRecorder:
         finally:
             partial.unlink(missing_ok=True)
         self.last_error = None
+        if self.retain_local:
+            self._maintain_spool()
         return path
 
     def _spooled(self) -> list[Path]:
         if not self.spool_dir.exists():
             return []
-        return sorted(self.spool_dir.glob("*.mp4"), key=lambda path: (path.stat().st_mtime, path.name))
+        files = list(self.spool_dir.glob("*.mp4"))
+        for path in files:
+            self._owned(path)
+        return sorted(files, key=lambda path: (path.stat().st_mtime, path.name))
 
     def _maintain_spool(self) -> list[Path]:
         files = self._spooled()
         cutoff = self._wall() - self._max_spool_age_s
         retained = []
         for path in files:
-            if path.stat().st_mtime < cutoff:
+            if not self.retain_local and path.stat().st_mtime < cutoff:
                 path.unlink(missing_ok=True)
                 self.expired += 1
             else:
@@ -343,7 +396,7 @@ class ClipRecorder:
         except OSError as exc:
             self._failure("spool_maintenance", exc, persistence=True)
             return
-        for path in paths:
+        for path in ([] if self.retain_local else paths):
             await self._send(path)
 
     async def _retry_loop(self) -> None:
