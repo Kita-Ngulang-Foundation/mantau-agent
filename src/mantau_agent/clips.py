@@ -22,6 +22,8 @@ import time
 import shutil
 import subprocess
 import tempfile
+import threading
+from functools import wraps
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +37,14 @@ log = logging.getLogger(__name__)
 # Server answers that retrying can never fix.
 # A clip can reach the server before its event; 404 must be retried.
 _PERMANENT = {400, 401, 403, 413, 415}
+
+
+def _spool_locked(operation):
+    @wraps(operation)
+    def locked(self, *args, **kwargs):
+        with self._spool_lock:
+            return operation(self, *args, **kwargs)
+    return locked
 
 
 def encode_mp4(frames: list[bytes], fps: float) -> bytes:
@@ -122,6 +132,18 @@ class ClipUploader:
         if self._owns_client:
             await self._client.aclose()
 
+    async def legacy_claims(self, ids: list[str]) -> list[dict]:
+        if len(ids) > 5:
+            raise ValueError("legacy batch too large")
+        response = await self._client.post(
+            f"{self.server_url}/agent-control/recordings/legacy-check", json={"event_ids": ids},
+            headers={"X-Mantau-Agent-ID": self.agent_id, "X-Mantau-Agent-Secret": self._secret})
+        response.raise_for_status()
+        rows = response.json()["recordings"]
+        if len(rows) > 5 or any(row["event_id"] not in ids for row in rows):
+            raise ValueError("invalid legacy response")
+        return rows
+
 
 @dataclass
 class _Capture:
@@ -139,7 +161,7 @@ class ClipRecorder:
                  retry_interval_s: float = 60.0, max_spool_bytes: int = 100 * 1024 * 1024,
                  max_spool_age_s: float = 24 * 60 * 60, max_pending_captures: int = 8,
                  max_encoding_tasks: int = 2, wall_clock: Callable[[], float] = time.time,
-                 retain_local: bool = False) -> None:
+                 retain_local: bool = False, legacy_spool_dir: str | Path | None = None) -> None:
         if any(not math.isfinite(value) or value <= 0
                for value in (fps, pre_s, post_s, retry_interval_s, max_spool_age_s)):
             raise ValueError("Clip rates, durations and retry interval must be positive and finite")
@@ -150,6 +172,8 @@ class ClipRecorder:
         # The caller chooses the writable directory, including the systemd unit's
         # service-owned path. Relative development paths follow the working directory.
         self.spool_dir = Path(spool_dir).expanduser().resolve()
+        self._spool_lock = threading.RLock()
+        self._legacy_migrator = None
         self.fps = fps
         self._interval_ms = 1000.0 / fps
         self._ring: deque[bytes] = deque(maxlen=max(1, round(pre_s * fps)))
@@ -185,6 +209,9 @@ class ClipRecorder:
             self._maintain_spool()
         except OSError as exc:
             self._failure("spool_init", exc, persistence=True)
+        if retain_local and legacy_spool_dir is not None:
+            from .legacy_clips import LegacyClipMigrator
+            self._legacy_migrator = LegacyClipMigrator(Path(legacy_spool_dir), self)
 
     def _failure(self, stage: str, exc: Exception, *, persistence: bool = False) -> None:
         self.failed += 1
@@ -242,6 +269,7 @@ class ClipRecorder:
             self.enabled = value
             self.clear_capture()
 
+    @_spool_locked
     def inventory(self) -> list[dict]:
         return [{"event_id": path.stem, "size_bytes": path.stat().st_size,
                  "captured_at_ms": max(0, round(path.stat().st_mtime * 1000))}
@@ -251,11 +279,30 @@ class ClipRecorder:
     async def transfer(self, event_id: str, transfer_id: str) -> bool:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", event_id):
             raise ValueError("invalid clip identifier")
-        path = self.spool_dir / f"{event_id}.mp4"
-        self._owned(path)
-        if not path.exists() or not 0 < path.stat().st_size <= 20 * 1024 * 1024:
-            return False
-        return await self.uploader.upload_transfer(event_id, transfer_id, path.read_bytes()) is True
+        with self._spool_lock:
+            path = self.spool_dir / f"{event_id}.mp4"
+            self._owned(path)
+            if not path.exists() or not 0 < path.stat().st_size <= 20 * 1024 * 1024:
+                return False
+            body = path.read_bytes()
+        return await self.uploader.upload_transfer(event_id, transfer_id, body) is True
+
+    @_spool_locked
+    def import_legacy(self, source: Path, occurred_at: float, is_current) -> str:
+        if (source.is_symlink() or source.resolve() != source.absolute()
+                or not 12 <= source.stat().st_size <= 20 * 1024 * 1024):
+            raise ValueError("unowned legacy clip")
+        body = source.read_bytes()
+        if body[4:8] != b"ftyp" or not is_current() or self._closed:
+            raise ValueError("legacy clip unavailable")
+        target = self.spool_dir / source.name
+        self._owned(target)
+        if target.exists() and target.read_bytes() != body:
+            raise ValueError("existing history differs")
+        self._store(source.stem, body, occurred_at)
+        if (target.exists() and target.read_bytes() != body) or source.read_bytes() != body or not is_current():
+            raise ValueError("legacy copy verification failed")
+        return hashlib.sha256(body).hexdigest()
 
     def _owned(self, path: Path) -> None:
         if self.spool_dir.resolve() != self.spool_dir or path.is_symlink() or path.resolve().parent != self.spool_dir:
@@ -265,6 +312,7 @@ class ClipRecorder:
         if not self._closed and self._retry_task is None:
             self._retry_task = asyncio.create_task(self._retry_loop(), name="clip-retry")
 
+    @_spool_locked
     def health(self) -> dict:
         try:
             files = self._spooled()
@@ -305,6 +353,7 @@ class ClipRecorder:
         if not self.retain_local:
             await self._send(path)
 
+    @_spool_locked
     def _store(self, event_id: str, body: bytes, occurred_at: float | None = None) -> Path:
         if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}", event_id):
             raise ValueError("invalid clip identifier")
@@ -347,6 +396,7 @@ class ClipRecorder:
             self._maintain_spool()
         return path
 
+    @_spool_locked
     def _spooled(self) -> list[Path]:
         if not self.spool_dir.exists():
             return []
@@ -355,6 +405,7 @@ class ClipRecorder:
             self._owned(path)
         return sorted(files, key=lambda path: (path.stat().st_mtime, path.name))
 
+    @_spool_locked
     def _maintain_spool(self) -> list[Path]:
         files = self._spooled()
         cutoff = self._wall() - self._max_spool_age_s
@@ -398,6 +449,11 @@ class ClipRecorder:
             return
         for path in ([] if self.retain_local else paths):
             await self._send(path)
+        if self._legacy_migrator is not None:
+            try:
+                await self._legacy_migrator.step()
+            except Exception as exc:
+                self._failure("legacy_migration_pending", exc)
 
     async def _retry_loop(self) -> None:
         while True:

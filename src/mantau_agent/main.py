@@ -145,6 +145,7 @@ async def build_pipeline(settings: Settings, *,
                 encode_jpeg=frames.encode, spool_dir=Path(settings.clip_spool_dir).expanduser().resolve() / settings.agent_id,
                 fps=settings.clip_fps, pre_s=settings.clip_pre_s, post_s=settings.clip_post_s,
                 max_pending_files=settings.clip_max_kept, retain_local=True,
+                legacy_spool_dir=Path(settings.clip_spool_dir).expanduser().resolve(),
             )
             clips.set_enabled(activity.settings.recordings.enabled)
             if owned_uplink is not None:

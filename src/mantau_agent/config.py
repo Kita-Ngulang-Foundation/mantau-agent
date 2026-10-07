@@ -41,7 +41,7 @@ class Settings(CoreSettings):
 
     # -- server connection ---------------------------------------------------
     server_url: str = "http://localhost:8100"
-    agent_id: str = ""      # saved by enrollment (POST /agents/enroll)
+    agent_id: str = Field(default="", pattern=r"^(?:[A-Za-z0-9][A-Za-z0-9._-]{0,127})?$")  # enrollment storage namespace
     agent_secret: str = ""  # saved by the same call; never typed by anyone
     # Single-use key from the Mantau app. With no saved enrollment, `run`
     # enrolls with it once (unattended Docker installs).
