@@ -131,7 +131,7 @@ async def test_detection_settings_are_applied_and_persisted(tmp_path):
         enrollment=EnrollmentConfiguration(server_url="http://s", agent_id="a", agent_secret="x"),
     ))
     engine = ActivityEngine()
-    pipeline = SimpleNamespace(router=SimpleNamespace(activity=engine))
+    pipeline = SimpleNamespace(router=SimpleNamespace(activity=engine, clips=None))
     executor = CommandExecutor(Settings(camera_id="cam-1"), pipeline, config_store=store)
 
     settings = DetectionSettings(version=4, bathroom={"warning_minutes": 12, "critical_minutes": 30})

@@ -107,7 +107,10 @@ class CommandExecutor:
     def status(self) -> dict:
         health = self.pipeline.health()
         caps = health["capabilities"]
+        clips = self.pipeline.router.clips
         return {
+            **({"local_recordings": clips.inventory()} if clips is not None and
+                getattr(clips, "retain_local", False) else {}),
             "platform": caps["platform"],
             "capabilities": {
                 "schema_version": 1,
@@ -225,11 +228,18 @@ class CommandExecutor:
             except ValidationError as exc:
                 raise CameraCommandError(CommandFailureReason.INVALID_REQUEST) from exc
             self.pipeline.router.activity.apply_settings(settings)
+            if self.pipeline.router.clips is not None:
+                self.pipeline.router.clips.set_enabled(settings.recordings.enabled)
             current = self.config_store.load()
             if current is not None:
                 self.config_store.save(current.model_copy(update={"detection_settings": settings}))
             return ({"camera_id": camera_id, "detection_settings_version": settings.version},
                     "Detection settings applied.")
+        if command.command_type is CommandType.UPLOAD_RECORDING:
+            clips = self.pipeline.router.clips
+            if clips is None or not await clips.transfer(command.payload["event_id"], command.payload["transfer_id"]):
+                raise RuntimeError("local recording transfer unavailable")
+            return {}, "Recording transferred."
         raise ValueError("unsupported command")
 
     def _camera(self, payload: dict) -> CameraRef:

@@ -99,7 +99,7 @@ async def test_persistence_failure_is_reported_without_losing_capture_loop(tmp_p
     monkeypatch.setattr(clips_module, "encode_mp4", lambda frames, fps: b"mp4")
     subject = recorder(tmp_path)
 
-    def full_disk(event_id, body):
+    def full_disk(event_id, body, occurred_at=None):
         raise OSError("disk full")
 
     monkeypatch.setattr(subject, "_store", full_disk)
@@ -158,3 +158,87 @@ def test_constructor_bounds_existing_spool_after_restart(tmp_path):
     assert subject.health()["evicted_capacity"] == 2
     assert [path.name for path in tmp_path.glob("*.mp4")] == ["event-2.mp4"]
     assert subject.health()["spooled_bytes"] == 6
+
+
+class TransferUploader(Uploader):
+    def __init__(self):
+        super().__init__(result=True)
+        self.transfers = []
+
+    async def upload_transfer(self, event_id, transfer_id, body):
+        self.transfers.append((event_id, transfer_id, body))
+        return True
+
+
+def local_recorder(directory, uploader=None, **limits):
+    return ClipRecorder(spool_dir=directory, uploader=uploader or TransferUploader(),
+                        encode_jpeg=lambda image: image, fps=1, pre_s=1, post_s=1,
+                        retain_local=True, max_pending_files=5, **limits)
+
+
+async def finish_local(subject, event_id="event-1", start_ms=1000):
+    """Retained clips wait until the ring plus post frames are full."""
+    subject.on_event(FallEvent(camera_id="camera-1", event_id=event_id))
+    for step in range(3):
+        subject.add_frame(b"jpeg", start_ms + step * 1000)
+    await asyncio.gather(*tuple(subject._tasks))
+
+
+async def test_retained_clip_stays_local_and_is_listed_not_uploaded(tmp_path, monkeypatch):
+    monkeypatch.setattr(clips_module, "encode_mp4", lambda frames, fps: b"mp4-body")
+    subject = local_recorder(tmp_path)
+    await finish_local(subject)
+    assert subject.uploader.uploads == [] and subject.uploader.transfers == []
+    listed = subject.inventory()
+    assert [(c["event_id"], c["size_bytes"]) for c in listed] == [("event-1", 8)]
+    await subject.close()
+
+
+async def test_only_the_five_newest_retained_clips_are_kept(tmp_path, monkeypatch):
+    monkeypatch.setattr(clips_module, "encode_mp4", lambda frames, fps: b"mp4-body")
+    subject = local_recorder(tmp_path)
+    for index in range(7):
+        await finish_local(subject, f"event-{index}", 1000 + index * 10_000)
+    assert len(list(tmp_path.glob("*.mp4"))) == 5
+    assert {c["event_id"] for c in subject.inventory()} == {f"event-{i}" for i in range(2, 7)}
+    await subject.close()
+
+
+async def test_transfer_sends_one_retained_clip_with_the_transfer_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(clips_module, "encode_mp4", lambda frames, fps: b"mp4-body")
+    subject = local_recorder(tmp_path)
+    await finish_local(subject)
+    assert await subject.transfer("event-1", "a" * 32) is True
+    assert subject.uploader.transfers == [("event-1", "a" * 32, b"mp4-body")]
+    assert await subject.transfer("missing", "b" * 32) is False
+    with pytest.raises(ValueError):
+        await subject.transfer("../escape", "c" * 32)
+    await subject.close()
+
+
+async def test_transfer_refuses_a_symlinked_clip(tmp_path, monkeypatch):
+    monkeypatch.setattr(clips_module, "encode_mp4", lambda frames, fps: b"mp4-body")
+    outside = tmp_path / "outside.mp4"
+    outside.write_bytes(b"secret")
+    spool = tmp_path / "spool"
+    subject = local_recorder(spool)
+    spool.mkdir(exist_ok=True)
+    try:
+        (spool / "evil.mp4").symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    with pytest.raises(OSError):
+        await subject.transfer("evil", "d" * 32)
+    await subject.close()
+
+
+async def test_disabling_recording_stops_new_clips_but_keeps_old_ones(tmp_path, monkeypatch):
+    monkeypatch.setattr(clips_module, "encode_mp4", lambda frames, fps: b"mp4-body")
+    subject = local_recorder(tmp_path)
+    await finish_local(subject)
+    subject.set_enabled(False)
+    subject.on_event(FallEvent(camera_id="camera-1", event_id="event-2"))
+    subject.add_frame(b"jpeg", 50_000)
+    await asyncio.gather(*tuple(subject._tasks))
+    assert [c["event_id"] for c in subject.inventory()] == ["event-1"]
+    await subject.close()
