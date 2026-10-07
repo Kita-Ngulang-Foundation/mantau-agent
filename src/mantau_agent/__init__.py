@@ -11,4 +11,4 @@ customer and the internet.
     health/     periodic heartbeat, reusing the same uplink client
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

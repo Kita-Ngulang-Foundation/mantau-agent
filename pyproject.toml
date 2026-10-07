@@ -1,6 +1,6 @@
 [project]
 name = "mantau-agent"
-version = "0.1.0"
+version = "0.1.1"
 description = "Scenario 2 agent: pulls RTSP on the customer's LAN, opens an outbound tunnel to the server"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
