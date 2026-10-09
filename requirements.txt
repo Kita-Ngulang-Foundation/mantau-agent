@@ -1,3 +1,3 @@
 # Standalone development install; update together with mantau-core.ref.
-mantau-core @ git+https://github.com/Kita-Ngulang-Foundation/mantau-core.git@53e63eb60e2bd547f0e625dab9a4647bc7c19a96
+mantau-core @ git+https://github.com/Kita-Ngulang-Foundation/mantau-core.git@50c9fb0f086fd225fd15c0afd677a11c32c21f9c
 -e .[dev]
