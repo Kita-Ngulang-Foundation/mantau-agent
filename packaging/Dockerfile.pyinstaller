@@ -14,14 +14,26 @@ COPY mantau-agent/mantau-core.ref /src/mantau-core.ref
 COPY mantau-agent/pyproject.toml mantau-agent/README.md /src/mantau-agent/
 COPY mantau-agent/src /src/mantau-agent/src
 COPY mantau-agent/packaging/entrypoint.py /src/mantau-agent/packaging/entrypoint.py
+COPY mantau-agent/scripts/third_party_notices.py /src/mantau-agent/scripts/third_party_notices.py
 
 RUN ref="$(tr -d '[:space:]' < /src/mantau-core.ref)" \
  && pip install --no-cache-dir "mantau-core @ https://github.com/Kita-Ngulang-Foundation/mantau-core/archive/${ref}.tar.gz" \
  && pip install --no-cache-dir -e /src/mantau-agent \
  && pip install --no-cache-dir pyinstaller
 
+# THIRD_PARTY_NOTICES.md for everything the binary bundles: each Python package
+# with its licence text (PyInstaller's bootloader included), and the native
+# libraries inside wheels (OpenCV's FFmpeg, LGPL-2.1). Embedded below and
+# printed by `mantau-agent --licenses`; build-linux.sh also copies it next to
+# the binary. pip-licenses goes to a throwaway directory and is not bundled.
+RUN pip install --no-cache-dir --target /tmp/pip-licenses pip-licenses \
+ && PYTHONPATH=/tmp/pip-licenses python /src/mantau-agent/scripts/third_party_notices.py \
+        --out /src/mantau-agent/THIRD_PARTY_NOTICES.md \
+ && rm -rf /tmp/pip-licenses
+
 WORKDIR /src/mantau-agent
 ENTRYPOINT ["python", "-m", "PyInstaller", "--onefile", \
             "--collect-data", "mantau_core", \
+            "--add-data", "/src/mantau-agent/THIRD_PARTY_NOTICES.md:.", \
             "--workpath", "/tmp/build", "--specpath", "/tmp/build", \
             "--distpath", "/out", "packaging/entrypoint.py"]
