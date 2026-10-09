@@ -232,6 +232,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", help="durable configuration path")
     parser.add_argument("--status-path", help="local health snapshot path")
     parser.add_argument("--server-url", help="override the configured server URL for this invocation")
+    parser.add_argument("--licenses", action="store_true",
+                        help="print the third-party notices shipped with this build and exit")
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("run", help="run the monitoring service")
     setup = commands.add_parser("setup", help="enroll and select a validated camera")
@@ -280,8 +282,27 @@ def _normalize_local_status(status: dict) -> dict:
     return value
 
 
+def _notices_path() -> Path | None:
+    """THIRD_PARTY_NOTICES.md written at build time: inside the PyInstaller
+    binary, at the repository root, or in the working directory (Docker /app)."""
+    candidates = []
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(getattr(sys, "_MEIPASS", "")) / "THIRD_PARTY_NOTICES.md")
+    candidates += [Path(__file__).resolve().parents[2] / "THIRD_PARTY_NOTICES.md",
+                   Path.cwd() / "THIRD_PARTY_NOTICES.md"]
+    return next((path for path in candidates if path.is_file()), None)
+
+
 def cli(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.licenses:
+        path = _notices_path()
+        if path is None:
+            print("mantau-agent: no THIRD_PARTY_NOTICES.md in this build "
+                  "(generate it with scripts/third_party_notices.py)", file=sys.stderr)
+            return 1
+        sys.stdout.write(path.read_text(encoding="utf-8"))
+        return 0
     command = args.command or "run"
     try:
         if command == "setup" and args.restore_backup:
