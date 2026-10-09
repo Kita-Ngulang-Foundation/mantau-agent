@@ -14,6 +14,9 @@ build_one() {
     mkdir -p "$REPO_DIR/dist"
     docker run --rm --platform "$PLATFORM" \
         -v "$REPO_DIR/dist:/out" "mantau-agent-pyi:$TAG" --name "$NAME"
+    # The notices embedded in the binary, published next to it.
+    docker run --rm --platform "$PLATFORM" --entrypoint cat "mantau-agent-pyi:$TAG" \
+        /src/mantau-agent/THIRD_PARTY_NOTICES.md > "$REPO_DIR/dist/$NAME.THIRD_PARTY_NOTICES.md"
 }
 
 build_one linux/amd64 amd64 mantau-agent-linux-x64

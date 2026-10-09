@@ -16,6 +16,10 @@ Outputs:
 
 - `dist/mantau-agent-linux-x64`
 - `dist/mantau-agent-linux-arm64`
+- `dist/mantau-agent-linux-x64.THIRD_PARTY_NOTICES.md` and
+  `dist/mantau-agent-linux-arm64.THIRD_PARTY_NOTICES.md`: the third-party
+  notices embedded in each binary (`mantau-agent --licenses` prints them).
+  Publish each next to its binary in the release.
 
 The build context is the parent `mantau-prototype` directory because the agent
 build recipe lives under the agent subdirectory. Its core package is fetched
