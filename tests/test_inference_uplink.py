@@ -254,7 +254,7 @@ class _ServerDetector:
                                    posture=Posture.LYING if lying else Posture.STANDING,
                                    confidence=0.8)
         events = ([FallEvent(camera_id=self.camera_id, occurred_at=self.clock(), confidence=0.9)]
-                  if lying and not self.config else [])
+                  if lying and self.config.get("motion", {}).get("enabled", True) else [])
         return Perception(events=events, observation=FrameObservation(
             camera_id=self.camera_id, at=self.clock(), people=(person,)))
 
