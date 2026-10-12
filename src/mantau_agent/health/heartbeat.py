@@ -35,6 +35,8 @@ class HeartbeatLoop:
         detector_alive: Callable[[], bool] = lambda: True,
         queue_depth: Callable[[], int] = lambda: 0,
         local_status: Callable[[], dict] | None = None,
+        stats: Callable[[], dict[str, float]] | None = None,
+        agent_version: str | None = None,
     ) -> None:
         self.agent_id = agent_id
         self.camera_id = camera_id
@@ -44,6 +46,17 @@ class HeartbeatLoop:
         self._detector_alive = detector_alive
         self._queue_depth = queue_depth
         self._local_status = local_status
+        self._stats = stats
+        self.agent_version = agent_version
+
+    def _build_stats(self) -> dict[str, float]:
+        if self._stats is None:
+            return {}
+        try:
+            return dict(self._stats())
+        except Exception:  # noqa: BLE001 -- a stats failure must never block a heartbeat
+            logging.getLogger(__name__).warning("Heartbeat stats unavailable", exc_info=True)
+            return {}
 
     async def run(self, *, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
@@ -55,6 +68,8 @@ class HeartbeatLoop:
                 camera_reachable=self._camera_reachable(),
                 detector_alive=self._detector_alive(),
                 queue_depth=self._queue_depth(),
+                agent_version=self.agent_version,
+                stats=self._build_stats(),
             )
             await self.uplink.send_heartbeat(heartbeat)
             try:

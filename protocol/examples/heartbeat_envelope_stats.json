@@ -1,0 +1,30 @@
+{
+  "agent_id": "agent-3f9a1c2b",
+  "seq": 43,
+  "sent_at": "2026-09-13T04:12:03.114000Z",
+  "kind": "heartbeat",
+  "payload": {
+    "agent_id": "agent-3f9a1c2b",
+    "camera_id": "cam-kamar-ibu",
+    "sent_at": "2026-09-13T04:12:03.114000Z",
+    "camera_reachable": true,
+    "detector_alive": true,
+    "queue_depth": 0,
+    "agent_version": "0.6.1",
+    "stats": {
+      "frames_decoded": 150.0,
+      "frames_uploaded": 148.0,
+      "upload_failures": 2.0,
+      "frames_dropped": 0.0,
+      "rtsp_reconnects": 0.0,
+      "camera_down_s": 0.0,
+      "process_uptime_s": 3600.0,
+      "memory_mb": 142.7,
+      "battery_pct": 85.0,
+      "charging": 0.0,
+      "battery_temp_c": 36.5,
+      "thermal_status": 0.0
+    }
+  },
+  "sig": "41a0d0710dd8d4a84a23f1413bedbe88aa908df770c25034e35abd1f8d8af9e2"
+}
