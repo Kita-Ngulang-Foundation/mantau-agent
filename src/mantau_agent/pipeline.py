@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from mantau_core.resilience import BackoffPolicy, Supervisor
 
 from .health.heartbeat import HeartbeatLoop
+from .health.stats import HeartbeatStatsCollector, agent_version
 from .health.status import StatusStore
 
 log = logging.getLogger(__name__)
@@ -52,6 +53,8 @@ class MonitoringPipeline:
             detector_alive=lambda: router.detector_alive,
             queue_depth=lambda: spool.depth() + sum(router.health()["queue_depths"].values()),
             local_status=router.health,
+            stats=HeartbeatStatsCollector(puller=puller, router=router),
+            agent_version=agent_version(),
         )
 
     async def start(self) -> None:

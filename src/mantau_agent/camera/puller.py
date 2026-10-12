@@ -45,8 +45,30 @@ class CameraPuller:
 
         self.reachable = False
         self.restarts = 0
+        self.frames_decoded = 0
         self.last_error: str | None = None
         self.last_frame_at: datetime | None = None
+        # Camera-down accounting (monotonic seconds); guarded by _lock.
+        self._down_since: float | None = None
+        self._down_total = 0.0
+
+    def _start_down_interval(self) -> None:
+        with self._lock:
+            if self._down_since is None:
+                self._down_since = time.monotonic()
+
+    def _end_down_interval(self) -> None:
+        with self._lock:
+            if self._down_since is not None:
+                self._down_total += time.monotonic() - self._down_since
+                self._down_since = None
+
+    def camera_down_seconds(self) -> float:
+        with self._lock:
+            total = self._down_total
+            if self._down_since is not None:
+                total += time.monotonic() - self._down_since
+            return total
 
     def _open_cv2(self):
         url = self.camera.stream_url(self.profile)
@@ -77,6 +99,7 @@ class CameraPuller:
             try:
                 cap = self._capture_factory()
                 self.reachable = True
+                self._end_down_interval()
                 attempt = 0
                 while not self._stop.is_set():
                     ok, image = cap.read()
@@ -86,6 +109,7 @@ class CameraPuller:
                     with self._lock:
                         self._latest = (image, ts_ms)
                         self.last_frame_at = datetime.now(timezone.utc)
+                        self.frames_decoded += 1
             except Exception as exc:  # noqa: BLE001 -- this IS the reconnect boundary
                 self.reachable = False
                 with self._lock:
@@ -100,6 +124,7 @@ class CameraPuller:
                     cap = None
                 if self._stop.is_set():
                     break
+                self._start_down_interval()
                 self.restarts += 1
                 delay = self._backoff.delay_for(attempt)
                 # Once the configured cap has been reached, retaining more
