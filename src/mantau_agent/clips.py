@@ -149,7 +149,10 @@ class ClipUploader:
 class _Capture:
     event_id: str
     frames: list[bytes]
-    remaining: int
+    timestamps: list[int]
+    started_ms: float | None
+    deadline_ms: float | None
+    deadline_clock: float
     generation: int = 0
     occurred_at: float | None = None
 
@@ -161,7 +164,8 @@ class ClipRecorder:
                  retry_interval_s: float = 60.0, max_spool_bytes: int = 100 * 1024 * 1024,
                  max_spool_age_s: float = 24 * 60 * 60, max_pending_captures: int = 8,
                  max_encoding_tasks: int = 2, wall_clock: Callable[[], float] = time.time,
-                 retain_local: bool = False, legacy_spool_dir: str | Path | None = None) -> None:
+                 retain_local: bool = False, legacy_spool_dir: str | Path | None = None,
+                 monotonic_clock: Callable[[], float] = time.monotonic) -> None:
         if any(not math.isfinite(value) or value <= 0
                for value in (fps, pre_s, post_s, retry_interval_s, max_spool_age_s)):
             raise ValueError("Clip rates, durations and retry interval must be positive and finite")
@@ -176,10 +180,12 @@ class ClipRecorder:
         self._legacy_migrator = None
         self.fps = fps
         self._interval_ms = 1000.0 / fps
-        self._ring: deque[bytes] = deque(maxlen=max(1, round(pre_s * fps)))
-        self._post_frames = max(1, round(post_s * fps))
+        self._pre_ms, self._post_ms = pre_s * 1000, post_s * 1000
+        self._ring: deque[bytes] = deque(maxlen=max(2, math.ceil(pre_s * fps) + 2))
+        self._ring_times: deque[int] = deque(maxlen=self._ring.maxlen)
         self._captures: list[_Capture] = []
         self._last_ts: int | None = None
+        self._last_frame_clock = 0.0
         self._tasks: set[asyncio.Task] = set()
         self._max_pending = max_pending_files
         self._max_spool_bytes = max_spool_bytes
@@ -188,6 +194,8 @@ class ClipRecorder:
         self._max_encoding_tasks = max_encoding_tasks
         self._retry_interval_s = retry_interval_s
         self._retry_task: asyncio.Task | None = None
+        self._capture_timer: asyncio.Task | None = None
+        self._monotonic = monotonic_clock
         self._wall = wall_clock
         self._generation = 0
         self.retain_local = retain_local
@@ -227,23 +235,53 @@ class ClipRecorder:
         """
         self._generation += 1
         self._ring.clear()
+        self._ring_times.clear()
         self._captures.clear()
         self._last_ts = None
         self._seen.clear()
 
     def add_frame(self, image, ts_ms: int) -> None:
+        self.advance(ts_ms)
         if not self.enabled or self._closed or (self._last_ts is not None and ts_ms - self._last_ts < self._interval_ms):
             return
         jpeg = self.encode_jpeg(image)
         if jpeg is None:
             return
         self._last_ts = ts_ms
+        self._last_frame_clock = self._monotonic()
         self._ring.append(jpeg)
+        self._ring_times.append(ts_ms)
+        # Keep one sample before the boundary for timestamp resampling.
+        while len(self._ring_times) > 1 and self._ring_times[1] <= ts_ms - self._pre_ms:
+            self._ring.popleft()
+            self._ring_times.popleft()
         for capture in list(self._captures):
+            if capture.started_ms is None:
+                capture.started_ms = float(ts_ms)
+                capture.deadline_ms = ts_ms + self._post_ms
+            if ts_ms > capture.deadline_ms:
+                continue
             capture.frames.append(jpeg)
-            capture.remaining -= 1
-            if capture.remaining <= 0:
-                self._captures.remove(capture)
+            capture.timestamps.append(ts_ms)
+        self.advance(ts_ms, include_boundary=True)
+
+    def advance(self, ts_ms: int | None = None, *, include_boundary: bool = False) -> None:
+        """Finish at elapsed-time deadlines, even if camera frames stop."""
+        if self._closed:
+            return
+        now = self._monotonic()
+        for capture in list(self._captures):
+            due_stream = (ts_ms is not None and capture.deadline_ms is not None
+                          and (ts_ms >= capture.deadline_ms if include_boundary else ts_ms > capture.deadline_ms))
+            due_clock = now >= capture.deadline_clock and (ts_ms is None or include_boundary
+                        or capture.deadline_ms is None or ts_ms > capture.deadline_ms)
+            if not due_stream and not due_clock:
+                continue
+            # Leave due captures pending until an encoding slot is available.
+            if len(self._tasks) >= self._max_encoding_tasks:
+                break
+            self._captures.remove(capture)
+            if capture.frames:
                 self._spawn(self._finish(capture))
 
     def on_event(self, event: FallEvent) -> None:
@@ -258,11 +296,34 @@ class ClipRecorder:
         if len(self._captures) >= self._max_captures:
             self._failure("capture_capacity", RuntimeError("capture queue full"))
             return
-        remaining = self._post_frames
-        if self.retain_local:
-            remaining += self._ring.maxlen - len(self._ring)
-        self._captures.append(_Capture(event.event_id, list(self._ring), remaining, self._generation,
-                                       event.occurred_at.timestamp()))
+        started = event.signals.get("candidate_ts_ms", self._last_ts)
+        if started is not None and (not math.isfinite(started) or self._last_ts is None
+                                    or started > self._last_ts or started < self._last_ts - self._pre_ms):
+            started = self._last_ts
+        frames, timestamps = list(self._ring), list(self._ring_times)
+        deadline = started + self._post_ms if started is not None else None
+        if started is not None:
+            first = max((i for i, ts in enumerate(timestamps) if ts <= started - self._pre_ms), default=0)
+            selected = [i for i in range(first, len(timestamps)) if timestamps[i] <= deadline]
+            frames, timestamps = [frames[i] for i in selected], [timestamps[i] for i in selected]
+        clock_deadline = (self._monotonic() + self._post_ms / 1000 if deadline is None
+                          else self._last_frame_clock + max(0, deadline - self._last_ts) / 1000)
+        self._captures.append(_Capture(event.event_id, frames, timestamps, started, deadline,
+                                       clock_deadline,
+                                       self._generation, event.occurred_at.timestamp()))
+        self._start_capture_timer()
+
+    def _start_capture_timer(self) -> None:
+        if self._capture_timer is None:
+            try:
+                self._capture_timer = asyncio.get_running_loop().create_task(self._capture_loop(), name="clip-deadlines")
+            except RuntimeError:
+                pass  # Synchronous callers may explicitly advance their clock.
+
+    async def _capture_loop(self) -> None:
+        while True:
+            await asyncio.sleep(0.1)
+            self.advance()
 
     def set_enabled(self, value: bool) -> None:
         if value != self.enabled:
@@ -311,6 +372,7 @@ class ClipRecorder:
     def start(self) -> None:
         if not self._closed and self._retry_task is None:
             self._retry_task = asyncio.create_task(self._retry_loop(), name="clip-retry")
+            self._start_capture_timer()
 
     @_spool_locked
     def health(self) -> dict:
@@ -339,7 +401,10 @@ class ClipRecorder:
         if capture.generation != self._generation:
             return
         try:
-            body = await asyncio.to_thread(encode_mp4, capture.frames, self.fps)
+            frames = self._timed_frames(capture)
+            if not frames:
+                return
+            body = await asyncio.to_thread(encode_mp4, frames, self.fps)
         except Exception as exc:  # encoding must never break capture
             self._failure("encoding", exc)
             return
@@ -352,6 +417,23 @@ class ClipRecorder:
             return
         if not self.retain_local:
             await self._send(path)
+
+    def _timed_frames(self, capture: _Capture) -> list[bytes]:
+        """Hold observed images between samples; never extend beyond available footage."""
+        start = max(capture.timestamps[0], capture.started_ms - self._pre_ms)
+        # The final sample lasts one observed input interval, not one encoder tick.
+        # This also covers the deadline when sparse input has no frame exactly on it.
+        tail_ms = self._interval_ms
+        if len(capture.timestamps) > 1:
+            tail_ms = max(tail_ms, capture.timestamps[-1] - capture.timestamps[-2])
+        end = min(capture.deadline_ms, capture.timestamps[-1] + tail_ms)
+        frames, index = [], 0
+        for step in range(max(0, math.ceil((end - start) / self._interval_ms - 1e-9))):
+            at = start + step * self._interval_ms
+            while index + 1 < len(capture.timestamps) and capture.timestamps[index + 1] <= at:
+                index += 1
+            frames.append(capture.frames[index])
+        return frames
 
     @_spool_locked
     def _store(self, event_id: str, body: bytes, occurred_at: float | None = None) -> Path:
@@ -462,6 +544,9 @@ class ClipRecorder:
 
     async def close(self) -> None:
         self._closed = True
+        if self._capture_timer is not None:
+            self._capture_timer.cancel()
+            await asyncio.gather(self._capture_timer, return_exceptions=True)
         if self._retry_task is not None:
             self._retry_task.cancel()
             await asyncio.gather(self._retry_task, return_exceptions=True)
