@@ -29,6 +29,7 @@ def recorder(directory, uploader=None, **limits):
 
 
 async def finish_event(subject, event_id="event-1"):
+    subject.add_frame(b"jpeg", 0)
     subject.on_event(FallEvent(camera_id="camera-1", event_id=event_id))
     subject.add_frame(b"jpeg", 1000)
     await asyncio.gather(*tuple(subject._tasks))
